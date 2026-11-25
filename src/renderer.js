@@ -86,3 +86,9 @@ async function refreshUsb() {
   });
 }
 $('usbRefresh').addEventListener('click', refreshUsb);
+
+$('usbDriver').addEventListener('click', async () => {
+  const res = await window.mirror.usbDriver();
+  $('driverHelp').classList.remove('hidden');
+  usbMsg(res.ok ? 'Zadig запущен (подтверди запрос Windows).' : res.error);
+});

@@ -24,6 +24,10 @@
       {
         "from": "resources/uxplay",
         "to": "uxplay"
+      },
+      {
+        "from": "resources/zadig",
+        "to": "zadig"
       }
     ],
     "win": {

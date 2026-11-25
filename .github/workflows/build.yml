@@ -66,6 +66,14 @@ jobs:
         with:
           name: uxplay
           path: resources/uxplay
+      - name: Download Zadig
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo pbatard/libwdi --pattern 'zadig-*.exe' --dir resources/zadig
+          mv resources/zadig/zadig-*.exe resources/zadig/zadig.exe
+          ls -la resources/zadig
       - run: npm install
       - run: npm run dist
       - uses: actions/upload-artifact@v4

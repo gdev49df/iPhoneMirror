@@ -85,6 +85,28 @@ ipcMain.handle('usb:enable', async (_e, d) => {
   const hit = await usbm.waitQuickTime(d.serial);
   return hit ? { ok: true, ready: true } : { ok: true, ready: false };
 });
+ipcMain.handle('usb:driver', () => {
+  const src = app.isPackaged
+    ? path.join(process.resourcesPath, 'zadig')
+    : path.join(__dirname, '..', 'resources', 'zadig');
+  if (!fs.existsSync(path.join(src, 'zadig.exe'))) {
+    return { ok: false, error: 'Не найден zadig.exe. Он добавляется при сборке установщика.' };
+  }
+  // Копируем в папку пользователя, чтобы zadig.ini был рядом и доступен для записи
+  const dst = path.join(app.getPath('userData'), 'zadig');
+  try {
+    fs.mkdirSync(dst, { recursive: true });
+    fs.cpSync(src, dst, { recursive: true, force: true });
+  } catch (e) {
+    return { ok: false, error: 'Не удалось подготовить Zadig: ' + e.message };
+  }
+  const exe = path.join(dst, 'zadig.exe');
+  const ps = `Start-Process -FilePath '${exe.replace(/'/g, "''")}' -WorkingDirectory '${dst.replace(/'/g, "''")}' -Verb RunAs`;
+  const p = spawn('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true, detached: true, stdio: 'ignore' });
+  p.on('error', () => {});
+  p.unref();
+  return { ok: true };
+});
 ipcMain.handle('pick-folder', async () => {
   const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'] });
   return r.canceled ? null : r.filePaths[0];

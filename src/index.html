@@ -72,7 +72,16 @@
       <li>Нажми «Обновить», затем «Включить захват» у своего устройства.</li>
     </ol>
     <div style="margin-top:14px" id="devices"></div>
-    <button id="usbRefresh" style="width:auto;padding:9px 16px;">Обновить</button>
+    <div style="display:flex;gap:8px;">
+      <button id="usbRefresh" style="width:auto;padding:9px 16px;">Обновить</button>
+      <button id="usbDriver" style="width:auto;padding:9px 16px;background:#2c2c36;">Установить драйвер</button>
+    </div>
+    <div id="driverHelp" class="hidden" style="margin-top:12px;color:var(--muted);font-size:13px;">
+      В окне Zadig: меню <b>Options → List All Devices</b> (если не включено), выбери в списке свой iPhone
+      («Apple Mobile Device USB Composite Device» или «iPhone»), слева от кнопки должен стоять <b>WinUSB</b>,
+      нажми <b>Replace Driver</b> и дождись сообщения об успехе. Потом вернись сюда и нажми «Обновить».
+      Пока стоит WinUSB, iTunes и Apple Devices этот iPhone не видят; вернуть можно в Диспетчере устройств (откат драйвера).
+    </div>
     <div id="usbLog" style="margin-top:12px;color:var(--muted);font-size:13px;white-space:pre-wrap"></div>
   </section>
 </main>
