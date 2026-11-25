@@ -33,3 +33,56 @@ $('toggle').addEventListener('click', async () => {
 
 window.mirror.onLog(log);
 window.mirror.onState(setState);
+
+// ---- вкладки ----
+function showTab(usb) {
+  $('airView').classList.toggle('hidden', usb);
+  $('usbView').classList.toggle('hidden', !usb);
+  $('tabAir').classList.toggle('active', !usb);
+  $('tabUsb').classList.toggle('active', usb);
+  if (usb) refreshUsb();
+}
+$('tabAir').addEventListener('click', () => showTab(false));
+$('tabUsb').addEventListener('click', () => showTab(true));
+
+// ---- USB ----
+function usbMsg(t) { $('usbLog').textContent = t; }
+
+async function refreshUsb() {
+  usbMsg('Ищу устройства…');
+  const res = await window.mirror.usbList();
+  const box = $('devices');
+  box.textContent = '';
+  if (!res.ok) { usbMsg('Ошибка: ' + res.error); return; }
+  if (!res.devices.length) { usbMsg('iPhone/iPad не найден. Проверь кабель и разблокируй устройство.'); return; }
+  usbMsg('');
+  res.devices.forEach((d) => {
+    const row = document.createElement('div');
+    row.className = 'dev';
+    const info = document.createElement('div');
+    info.textContent = 'Apple устройство (PID 0x' + d.pid.toString(16) + ')';
+    const sm = document.createElement('small');
+    sm.textContent = d.openError ? 'Нет доступа по USB: нужен драйвер' : 'Серийный номер: ' + (d.serial || 'неизвестен');
+    info.appendChild(sm);
+    row.appendChild(info);
+    if (d.qtReady) {
+      const b = document.createElement('span');
+      b.className = 'badge';
+      b.textContent = 'Режим захвата включён';
+      row.appendChild(b);
+    } else {
+      const btn = document.createElement('button');
+      btn.textContent = 'Включить захват';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        usbMsg('Включаю режим захвата…');
+        const r = await window.mirror.usbEnable(d);
+        usbMsg(r.ok ? (r.ready ? 'Готово: устройство в режиме захвата.' : 'Запрос принят, но режим не появился. Переподключи кабель и повтори.') : r.error);
+        refreshUsb();
+      });
+      row.appendChild(btn);
+    }
+    box.appendChild(row);
+  });
+}
+$('usbRefresh').addEventListener('click', refreshUsb);

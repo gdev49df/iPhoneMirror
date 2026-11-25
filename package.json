@@ -16,11 +16,28 @@
   "build": {
     "appId": "dev.wdev.applemirror",
     "productName": "Apple Mirror",
-    "files": ["src/**/*", "package.json"],
-    "extraResources": [
-      { "from": "resources/uxplay", "to": "uxplay" }
+    "files": [
+      "src/**/*",
+      "package.json"
     ],
-    "win": { "target": "nsis" },
-    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+    "extraResources": [
+      {
+        "from": "resources/uxplay",
+        "to": "uxplay"
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "asarUnpack": [
+      "**/node_modules/usb/**"
+    ]
+  },
+  "dependencies": {
+    "usb": "^2.14.0"
   }
 }

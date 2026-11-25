@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const usbm = require('./usb');
 
 let win = null;
 let proc = null;
@@ -74,6 +75,16 @@ function createWindow() {
 
 ipcMain.handle('start', (_e, opts) => start(opts || {}));
 ipcMain.handle('stop', () => { stop(); return { ok: true }; });
+ipcMain.handle('usb:list', async () => {
+  try { return { ok: true, devices: await usbm.listDevices() }; }
+  catch (e) { return { ok: false, error: String(e.message || e) }; }
+});
+ipcMain.handle('usb:enable', async (_e, d) => {
+  const r = await usbm.enableQuickTime(d.address, d.bus);
+  if (!r.ok) return r;
+  const hit = await usbm.waitQuickTime(d.serial);
+  return hit ? { ok: true, ready: true } : { ok: true, ready: false };
+});
 ipcMain.handle('pick-folder', async () => {
   const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'] });
   return r.canceled ? null : r.filePaths[0];
