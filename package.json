@@ -31,7 +31,8 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "Apple-Mirror-Setup-${version}.exe"
     },
     "asarUnpack": [
       "**/node_modules/usb/**"
