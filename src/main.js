@@ -107,6 +107,7 @@ ipcMain.handle('qt:start', async (_e, d) => {
     try { await s.stop(); } catch {}
     if (qt === s) qt = null;
     if (msg === 'NO_QT_DEVICE') return { ok: false, code: 'NO_QT_DEVICE' };
+    if (/NOT_SUPPORTED|ACCESS|NO_DEVICE|IFACE/.test(msg)) return { ok: false, code: 'QT_NEED_DRIVER', detail: msg };
     return { ok: false, code: 'QT_START', detail: msg };
   }
 });
