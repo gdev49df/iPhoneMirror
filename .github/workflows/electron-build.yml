@@ -1,8 +1,11 @@
-name: build-windows
+name: electron-build-and-release
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'electron-version/**'
+      - '.github/workflows/electron-build.yml'
   workflow_dispatch:
 
 permissions:
@@ -57,6 +60,9 @@ jobs:
   app:
     needs: uxplay
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: electron-version
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -65,7 +71,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: uxplay
-          path: resources/uxplay
+          path: electron-version/resources/uxplay
       - name: Download Zadig
         shell: bash
         env:
@@ -79,7 +85,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Apple-Mirror-Setup
-          path: dist/*.exe
+          path: electron-version/dist/*.exe
 
   release:
     needs: app
@@ -91,7 +97,7 @@ jobs:
           name: Apple-Mirror-Setup
           path: out
       - id: ver
-        run: echo "v=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+        run: echo "v=$(node -p "require('./electron-version/package.json').version")" >> "$GITHUB_OUTPUT"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.v }}
