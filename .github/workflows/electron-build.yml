@@ -98,7 +98,7 @@ jobs:
           path: out
       - id: ver
         run: echo "v=$(node -p "require('./electron-version/package.json').version")" >> "$GITHUB_OUTPUT"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.ver.outputs.v }}
           name: Apple Mirror v${{ steps.ver.outputs.v }}
