@@ -1,0 +1,26 @@
+{
+  "name": "apple-mirror",
+  "version": "0.1.0",
+  "description": "Зеркалирование экрана iPhone/iPad на Windows через AirPlay",
+  "main": "src/main.js",
+  "author": "W-Dev",
+  "license": "GPL-3.0-only",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.wdev.applemirror",
+    "productName": "Apple Mirror",
+    "files": ["src/**/*", "package.json"],
+    "extraResources": [
+      { "from": "resources/uxplay", "to": "uxplay" }
+    ],
+    "win": { "target": "nsis" },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+  }
+}

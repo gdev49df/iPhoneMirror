@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+<title>Apple Mirror</title>
+<style>
+  :root { --bg:#0b0b0f; --card:#14141b; --line:#23232e; --text:#f2f2f7; --muted:#8e8e9a; --accent:#0a84ff; --ok:#30d158; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif; display:flex; flex-direction:column; min-height:100vh; }
+  header { padding:22px 28px 8px; display:flex; align-items:center; justify-content:space-between; }
+  h1 { margin:0; font-size:20px; font-weight:600; letter-spacing:-.2px; }
+  .status { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:13px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#555; }
+  .on .dot { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  main { padding:12px 28px; display:grid; grid-template-columns:260px 1fr; gap:16px; flex:1; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:12px 0 4px; }
+  label:first-child { margin-top:0; }
+  input[type=text], select { width:100%; padding:9px 10px; background:#0e0e14; border:1px solid var(--line); border-radius:9px; color:var(--text); font:inherit; }
+  .row { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--text); }
+  .row input { accent-color:var(--accent); }
+  button { width:100%; margin-top:16px; padding:11px; border:0; border-radius:10px; background:var(--accent); color:#fff; font:600 14px inherit; cursor:pointer; }
+  button.stop { background:#ff453a; }
+  button:hover { filter:brightness(1.08); }
+  #log { background:#0e0e14; border:1px solid var(--line); border-radius:10px; padding:10px; height:100%; min-height:260px; overflow:auto; white-space:pre-wrap; font:12px/1.5 Consolas,monospace; color:#b8b8c4; }
+  ol { margin:0 0 0 18px; padding:0; color:var(--muted); font-size:13px; }
+  footer { padding:14px 28px 18px; color:var(--muted); font-size:12px; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Apple Mirror</h1>
+  <div class="status" id="status"><span class="dot"></span><span id="statusText">Остановлено</span></div>
+</header>
+<main>
+  <section class="card">
+    <label>Имя в списке AirPlay</label>
+    <input type="text" id="name" value="Apple Mirror">
+    <label>Частота кадров</label>
+    <select id="fps"><option value="30">30 fps</option><option value="60" selected>60 fps</option></select>
+    <div class="row"><input type="checkbox" id="fullscreen"><span>Полный экран</span></div>
+    <div class="row"><input type="checkbox" id="noAudio"><span>Без звука</span></div>
+    <div class="row"><input type="checkbox" id="pin"><span>Запрашивать PIN</span></div>
+    <button id="toggle">Запустить</button>
+  </section>
+  <section class="card" style="display:flex;flex-direction:column;gap:12px;">
+    <ol>
+      <li>Подключи ПК и iPhone к одной Wi-Fi сети.</li>
+      <li>Нажми «Запустить».</li>
+      <li>На iPhone: Пункт управления → Повтор экрана → выбери имя устройства.</li>
+    </ol>
+    <div id="log"></div>
+  </section>
+</main>
+<footer>Создано @bauyrzhanov_12_</footer>
+<script src="renderer.js"></script>
+</body>
+</html>

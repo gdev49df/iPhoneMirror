@@ -1,0 +1,67 @@
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  uxplay:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-libplist
+            mingw-w64-ucrt-x86_64-gstreamer
+            mingw-w64-ucrt-x86_64-gst-plugins-base
+            mingw-w64-ucrt-x86_64-gst-plugins-good
+            mingw-w64-ucrt-x86_64-gst-plugins-bad
+            mingw-w64-ucrt-x86_64-gst-libav
+            mingw-w64-ucrt-x86_64-mDNSResponder
+      - name: Build UxPlay
+        run: |
+          git clone --depth 1 https://github.com/FDH2/UxPlay.git
+          cd UxPlay
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Collect exe and DLLs
+        run: |
+          mkdir -p /c/uxplay-out
+          cp UxPlay/build/uxplay.exe /c/uxplay-out/
+          ldd UxPlay/build/uxplay.exe | grep -i ucrt64 | awk '{print $3}' | xargs -I{} cp {} /c/uxplay-out/ || true
+          cp -r /ucrt64/lib/gstreamer-1.0 /c/uxplay-out/ || true
+          cp /ucrt64/libexec/gstreamer-1.0/gst-plugin-scanner.exe /c/uxplay-out/ || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uxplay
+          path: C:/uxplay-out
+
+  app:
+    needs: uxplay
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/download-artifact@v4
+        with:
+          name: uxplay
+          path: resources/uxplay
+      - run: npm install
+      - run: npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Apple-Mirror-Setup
+          path: dist/*.exe

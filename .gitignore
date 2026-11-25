@@ -1,0 +1,4 @@
+node_modules/
+dist/
+resources/uxplay/*
+!resources/uxplay/.gitkeep
