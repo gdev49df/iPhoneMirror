@@ -16,6 +16,9 @@ const I18N = {
     usb_dev: 'Устройство Apple', usb_noaccess: 'Нет доступа по USB: нужен драйвер', usb_serial: 'Серийный номер: ', usb_unknown: 'неизвестен',
     usb_ready: 'Режим захвата включён', usb_enable: 'Включить захват', usb_enabling: 'Включаю режим захвата…',
     usb_done: 'Готово: устройство в режиме захвата.', usb_notready: 'Запрос принят, но режим не появился. Переподключи кабель и повтори.',
+    open_zadig: 'Открыть папку Zadig',
+    err_ZADIG_BLOCKED: 'Файл zadig.exe удалён антивирусом или защитой Windows. Добавь в исключения папку: ',
+    err_ZADIG_LAUNCH: 'Не удалось запустить Zadig (запрос администратора отклонён?): ',
     zadig_started: 'Zadig запущен (подтверди запрос Windows).',
     err_NO_UXPLAY: 'Не найден uxplay.exe. Положи сборку UxPlay в папку resources/uxplay.',
     err_NO_ZADIG: 'Не найден zadig.exe. Он добавляется при сборке установщика.',
@@ -45,6 +48,9 @@ const I18N = {
     usb_dev: 'Apple device', usb_noaccess: 'No USB access: driver required', usb_serial: 'Serial number: ', usb_unknown: 'unknown',
     usb_ready: 'Capture mode enabled', usb_enable: 'Enable capture', usb_enabling: 'Enabling capture mode…',
     usb_done: 'Done: the device is in capture mode.', usb_notready: 'Request accepted, but capture mode did not appear. Replug the cable and try again.',
+    open_zadig: 'Open Zadig folder',
+    err_ZADIG_BLOCKED: 'zadig.exe was removed by antivirus or Windows protection. Add this folder to exclusions: ',
+    err_ZADIG_LAUNCH: 'Could not start Zadig (administrator prompt declined?): ',
     zadig_started: 'Zadig started (confirm the Windows prompt).',
     err_NO_UXPLAY: 'uxplay.exe not found. Put the UxPlay build into resources/uxplay.',
     err_NO_ZADIG: 'zadig.exe not found. It is added when the installer is built.',
@@ -74,6 +80,9 @@ const I18N = {
     usb_dev: 'Apple 设备', usb_noaccess: '无法通过 USB 访问：需要驱动', usb_serial: '序列号：', usb_unknown: '未知',
     usb_ready: '捕获模式已启用', usb_enable: '启用捕获', usb_enabling: '正在启用捕获模式…',
     usb_done: '完成：设备已进入捕获模式。', usb_notready: '请求已接受，但未进入捕获模式。请重新插拔数据线后重试。',
+    open_zadig: '打开 Zadig 文件夹',
+    err_ZADIG_BLOCKED: 'zadig.exe 被杀毒软件或 Windows 防护删除。请将此文件夹加入排除项：',
+    err_ZADIG_LAUNCH: '无法启动 Zadig（管理员提示被拒绝？）：',
     zadig_started: 'Zadig 已启动（请确认 Windows 提示）。',
     err_NO_UXPLAY: '未找到 uxplay.exe。请将 UxPlay 放入 resources/uxplay 文件夹。',
     err_NO_ZADIG: '未找到 zadig.exe。它会在构建安装程序时添加。',
@@ -212,6 +221,8 @@ async function refreshUsb() {
   });
 }
 $('usbRefresh').addEventListener('click', refreshUsb);
+
+$('usbFolder').addEventListener('click', () => window.mirror.usbDriverFolder());
 
 $('usbDriver').addEventListener('click', async () => {
   const res = await window.mirror.usbDriver();

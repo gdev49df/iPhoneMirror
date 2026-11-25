@@ -86,15 +86,16 @@ ipcMain.handle('usb:enable', async (_e, d) => {
   const hit = await usbm.waitQuickTime(d.serial);
   return hit ? { ok: true, ready: true } : { ok: true, ready: false };
 });
-ipcMain.handle('usb:driver', () => {
+function zadigDir() {
+  return path.join(app.getPath('userData'), 'zadig');
+}
+ipcMain.handle('usb:driver', async () => {
   const src = app.isPackaged
     ? path.join(process.resourcesPath, 'zadig')
     : path.join(__dirname, '..', 'resources', 'zadig');
-  if (!fs.existsSync(path.join(src, 'zadig.exe'))) {
-    return { ok: false, code: 'NO_ZADIG' };
-  }
+  if (!fs.existsSync(path.join(src, 'zadig.exe'))) return { ok: false, code: 'NO_ZADIG' };
   // Копируем в папку пользователя, чтобы zadig.ini был рядом и доступен для записи
-  const dst = path.join(app.getPath('userData'), 'zadig');
+  const dst = zadigDir();
   try {
     fs.mkdirSync(dst, { recursive: true });
     fs.cpSync(src, dst, { recursive: true, force: true });
@@ -102,12 +103,33 @@ ipcMain.handle('usb:driver', () => {
     return { ok: false, code: 'ZADIG_PREP', detail: e.message };
   }
   const exe = path.join(dst, 'zadig.exe');
-  const ps = `Start-Process -FilePath '${exe.replace(/'/g, "''")}' -WorkingDirectory '${dst.replace(/'/g, "''")}' -Verb RunAs`;
-  const p = spawn('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true, detached: true, stdio: 'ignore' });
-  p.on('error', () => {});
-  p.unref();
-  return { ok: true };
+  await new Promise((r) => setTimeout(r, 400));
+  if (!fs.existsSync(exe)) return { ok: false, code: 'ZADIG_BLOCKED', detail: dst };
+  const q = (s) => s.replace(/'/g, "''");
+  const script =
+    `try { Start-Process -FilePath '${q(exe)}' -WorkingDirectory '${q(dst)}' -Verb RunAs -ErrorAction Stop; exit 0 } ` +
+    `catch { [Console]::Out.Write($_.Exception.Message); exit 1 }`;
+  const enc = Buffer.from(script, 'utf16le').toString('base64');
+  return await new Promise((resolve) => {
+    let out = '';
+    const p = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { windowsHide: true });
+    p.stdout.on('data', (d) => (out += d.toString()));
+    p.stderr.on('data', (d) => (out += d.toString()));
+    p.on('error', (e) => resolve({ ok: false, code: 'ZADIG_LAUNCH', detail: e.message }));
+    p.on('close', (code) => {
+      setTimeout(() => {
+        if (!fs.existsSync(exe)) return resolve({ ok: false, code: 'ZADIG_BLOCKED', detail: dst });
+        resolve(code === 0 ? { ok: true, dir: dst } : { ok: false, code: 'ZADIG_LAUNCH', detail: out.trim() });
+      }, 800);
+    });
+  });
 });
+ipcMain.handle('usb:driver-folder', () => {
+  const d = zadigDir();
+  fs.mkdirSync(d, { recursive: true });
+  return shell.openPath(d);
+});
+
 const REPO = 'gdev49df/iPhoneMirror';
 function newer(a, b) {
   const pa = String(a).replace(/^v/, '').split('.').map(Number);

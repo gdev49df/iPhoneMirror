@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('mirror', {
   usbList: () => ipcRenderer.invoke('usb:list'),
   usbEnable: (d) => ipcRenderer.invoke('usb:enable', d),
   usbDriver: () => ipcRenderer.invoke('usb:driver'),
+  usbDriverFolder: () => ipcRenderer.invoke('usb:driver-folder'),
   version: () => ipcRenderer.invoke('app:version'),
   checkUpdate: () => ipcRenderer.invoke('update:check'),
   installUpdate: () => ipcRenderer.invoke('update:install'),
