@@ -1,6 +1,6 @@
 {
   "name": "apple-mirror",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Зеркалирование экрана iPhone/iPad на Windows через AirPlay",
   "main": "src/main.js",
   "author": "W-Dev",

@@ -37,7 +37,7 @@ function readSerial(device) {
     const idx = device.deviceDescriptor.iSerialNumber;
     device.getStringDescriptor(idx, (err, s) => {
       try { device.close(); } catch {}
-      resolve({ serial: err ? null : s, openError: null });
+      resolve({ serial: err || !s ? null : String(s).replace(/[^\x20-\x7e]/g, ''), openError: null });
     });
   });
 }
@@ -60,7 +60,7 @@ async function listDevices() {
   return out;
 }
 
-// Включить QuickTime-конфигурацию: vendor control request 0x52, wValue=1, wIndex=2.
+// Включить QuickTime-конфигурацию: vendor control request 0x52, wValue=0, wIndex=2 (как в qvh).
 function enableQuickTime(address, bus) {
   return new Promise((resolve) => {
     const dev = lib().getDeviceList().find((d) => d.deviceAddress === address && d.busNumber === bus);
@@ -75,7 +75,7 @@ function enableQuickTime(address, bus) {
         detail: String(e.message || e)
       });
     }
-    dev.controlTransfer(0x40, 0x52, 0x01, 0x02, Buffer.alloc(0), (err) => {
+    dev.controlTransfer(0x40, 0x52, 0x00, 0x02, Buffer.alloc(0), (err) => {
       try { dev.close(); } catch {}
       // после успешного запроса устройство само переподключается, ошибка тут возможна
       resolve(err ? { ok: false, code: 'REJECTED', detail: err.message } : { ok: true });

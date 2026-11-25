@@ -87,12 +87,20 @@
       <li data-i18n="usb2"></li>
     </ol>
     <div style="margin-top:14px" id="devices"></div>
+    <div id="qtArea" class="hidden" style="margin-bottom:14px">
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
+        <button id="qtStop" class="ghost" data-i18n="usb_stop"></button>
+        <span id="qtInfo" style="color:var(--muted);font-size:13px"></span>
+      </div>
+      <canvas id="qtCanvas" width="320" height="240" style="max-width:100%;max-height:62vh;background:#000;border-radius:10px;display:block;margin:0 auto"></canvas>
+    </div>
     <div style="display:flex;gap:8px;">
       <button id="usbRefresh" style="width:auto;padding:9px 16px;" data-i18n="refresh"></button>
       <button id="usbDriver" style="width:auto;padding:9px 16px;background:#2c2c36;" data-i18n="install_driver"></button>
       <button id="usbFolder" class="ghost" style="padding:9px 14px;" data-i18n="open_zadig"></button>
     </div>
     <div id="driverHelp" class="hidden" style="margin-top:12px;color:var(--muted);font-size:13px;" data-i18n-html="driver_help"></div>
+    <div id="qtLog" style="margin-top:12px;max-height:150px;overflow:auto;background:#0e0e14;border:1px solid var(--line);border-radius:10px;padding:8px;font:12px/1.5 Consolas,monospace;color:#b8b8c4;white-space:pre-wrap" class="hidden"></div>
     <div id="usbLog" style="margin-top:12px;color:var(--muted);font-size:13px;white-space:pre-wrap"></div>
   </section>
 </main>

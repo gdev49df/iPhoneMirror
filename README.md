@@ -15,8 +15,12 @@ Windows-приложение: показывает экран iPhone/iPad на �
 - Вручную: положить `uxplay.exe` с DLL и папкой `gstreamer-1.0` в `resources/uxplay`, затем `npm install && npm run dist`.
 - Запуск для разработки: `npm install && npm start`.
 
+## USB-режим
+Вкладка USB: «Включить захват» → «Показать экран». Видео принимается по протоколу QuickTime Screen Capture
+(порт на JS по [quicktime_video_hack](https://github.com/danielpaulus/quicktime_video_hack), MIT) и декодируется через WebCodecs.
+
 ## Что пока не сделано
-- USB-режим (как в iPhoneMirror) — нужен отдельный протокол Screen Capture через libusb.
+- Звук в USB-режиме (видео H.264 уже выводится в окне).
 - Видео сейчас выводится окном UxPlay (GStreamer), а не внутри окна Electron.
 - Запись, скриншоты, трансляция в OBS.
 

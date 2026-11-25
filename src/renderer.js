@@ -19,6 +19,10 @@ const I18N = {
     open_zadig: 'Открыть папку Zadig',
     err_ZADIG_BLOCKED: 'Файл zadig.exe удалён антивирусом или защитой Windows. Добавь в исключения папку: ',
     err_ZADIG_LAUNCH: 'Не удалось запустить Zadig (запрос администратора отклонён?): ',
+    usb_start: 'Показать экран', usb_stop: 'Остановить показ',
+    err_NO_QT_DEVICE: 'Не найден iPhone в режиме захвата. Нажми «Включить захват» и повтори.',
+    err_QT_START: 'Не удалось начать показ: ',
+    qt_nodec: 'В этой системе нет WebCodecs для H.264.',
     zadig_started: 'Zadig запущен (подтверди запрос Windows).',
     err_NO_UXPLAY: 'Не найден uxplay.exe. Положи сборку UxPlay в папку resources/uxplay.',
     err_NO_ZADIG: 'Не найден zadig.exe. Он добавляется при сборке установщика.',
@@ -51,6 +55,10 @@ const I18N = {
     open_zadig: 'Open Zadig folder',
     err_ZADIG_BLOCKED: 'zadig.exe was removed by antivirus or Windows protection. Add this folder to exclusions: ',
     err_ZADIG_LAUNCH: 'Could not start Zadig (administrator prompt declined?): ',
+    usb_start: 'Show screen', usb_stop: 'Stop',
+    err_NO_QT_DEVICE: 'No iPhone in capture mode found. Click “Enable capture” and try again.',
+    err_QT_START: 'Could not start streaming: ',
+    qt_nodec: 'H.264 WebCodecs are not available on this system.',
     zadig_started: 'Zadig started (confirm the Windows prompt).',
     err_NO_UXPLAY: 'uxplay.exe not found. Put the UxPlay build into resources/uxplay.',
     err_NO_ZADIG: 'zadig.exe not found. It is added when the installer is built.',
@@ -83,6 +91,10 @@ const I18N = {
     open_zadig: '打开 Zadig 文件夹',
     err_ZADIG_BLOCKED: 'zadig.exe 被杀毒软件或 Windows 防护删除。请将此文件夹加入排除项：',
     err_ZADIG_LAUNCH: '无法启动 Zadig（管理员提示被拒绝？）：',
+    usb_start: '显示屏幕', usb_stop: '停止显示',
+    err_NO_QT_DEVICE: '未找到处于捕获模式的 iPhone。请点击“启用捕获”后重试。',
+    err_QT_START: '无法开始显示：',
+    qt_nodec: '此系统不支持 H.264 WebCodecs。',
     zadig_started: 'Zadig 已启动（请确认 Windows 提示）。',
     err_NO_UXPLAY: '未找到 uxplay.exe。请将 UxPlay 放入 resources/uxplay 文件夹。',
     err_NO_ZADIG: '未找到 zadig.exe。它会在构建安装程序时添加。',
@@ -204,7 +216,14 @@ async function refreshUsb() {
       const b = document.createElement('span');
       b.className = 'badge';
       b.textContent = t('usb_ready');
-      row.appendChild(b);
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;align-items:center;gap:10px';
+      wrap.appendChild(b);
+      const sb = document.createElement('button');
+      sb.textContent = t('usb_start');
+      sb.addEventListener('click', () => startQt(d, sb));
+      wrap.appendChild(sb);
+      row.appendChild(wrap);
     } else {
       const btn = document.createElement('button');
       btn.textContent = t('usb_enable');
@@ -270,3 +289,65 @@ $('updBtn').addEventListener('click', async () => {
 // ---------- старт ----------
 window.mirror.version().then((v) => ($('ver').textContent = 'v' + v));
 applyLang();
+
+// ---------- показ экрана по USB ----------
+let dec = null, decKey = '', needKey = true, ts = 0;
+const canvas = $('qtCanvas');
+const cx = canvas.getContext('2d');
+
+function qtLog(t) {
+  const el = $('qtLog');
+  el.classList.remove('hidden');
+  el.textContent += t.endsWith('\n') ? t : t + '\n';
+  if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-12000);
+  el.scrollTop = el.scrollHeight;
+}
+
+function mkDecoder(codec, w, h) {
+  if (dec && dec.state !== 'closed') { try { dec.close(); } catch {} }
+  dec = new VideoDecoder({
+    output: (f) => {
+      if (canvas.width !== f.displayWidth || canvas.height !== f.displayHeight) {
+        canvas.width = f.displayWidth;
+        canvas.height = f.displayHeight;
+      }
+      cx.drawImage(f, 0, 0);
+      f.close();
+    },
+    error: (e) => { qtLog('Decoder: ' + e.message); needKey = true; dec = null; decKey = ''; }
+  });
+  dec.configure({ codec, codedWidth: w, codedHeight: h, avc: { format: 'annexb' }, optimizeForLatency: true });
+  decKey = codec + w + h;
+  needKey = true;
+}
+
+window.mirror.onQtLog(qtLog);
+window.mirror.onQtState((s) => {
+  $('qtArea').classList.toggle('hidden', !s.running);
+  if (!s.running) {
+    if (dec && dec.state !== 'closed') { try { dec.close(); } catch {} }
+    dec = null; decKey = '';
+  }
+});
+window.mirror.onQtFrame((f) => {
+  if (!('VideoDecoder' in window)) return;
+  if (f.codec && decKey !== f.codec + f.width + f.height) mkDecoder(f.codec, f.width, f.height);
+  if (!dec || dec.state !== 'configured') return;
+  if (needKey && !f.key) return;
+  if (f.key) needKey = false;
+  if (dec.decodeQueueSize > 8 && !f.key) return;
+  try {
+    dec.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: ts, data: f.data }));
+  } catch (e) { qtLog('decode: ' + e.message); needKey = true; }
+  ts += 16667;
+});
+
+async function startQt(d, btn) {
+  if (!('VideoDecoder' in window)) { usbMsg(() => t('qt_nodec')); return; }
+  btn.disabled = true;
+  $('qtLog').textContent = '';
+  const res = await window.mirror.qtStart({ serial: d.serial });
+  btn.disabled = false;
+  if (!res.ok) { usbMsg(() => errText(res)); qtLog(errText(res)); }
+}
+$('qtStop').addEventListener('click', () => window.mirror.qtStop());

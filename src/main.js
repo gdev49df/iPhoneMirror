@@ -4,6 +4,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const usbm = require('./usb');
+const { QtSession } = require('./qt/session');
 
 let win = null;
 let proc = null;
@@ -89,6 +90,28 @@ ipcMain.handle('usb:enable', async (_e, d) => {
 function zadigDir() {
   return path.join(app.getPath('userData'), 'zadig');
 }
+let qt = null;
+ipcMain.handle('qt:start', async (_e, d) => {
+  if (qt) return { ok: true };
+  const s = new QtSession(d && d.serial);
+  qt = s;
+  s.on('log', (t) => send('qt:log', t));
+  s.on('frame', (f) => send('qt:frame', f));
+  s.on('stopped', () => { if (qt === s) qt = null; send('qt:state', { running: false }); });
+  try {
+    await s.start();
+    send('qt:state', { running: true });
+    return { ok: true };
+  } catch (e) {
+    const msg = String(e.message || e);
+    try { await s.stop(); } catch {}
+    if (qt === s) qt = null;
+    if (msg === 'NO_QT_DEVICE') return { ok: false, code: 'NO_QT_DEVICE' };
+    return { ok: false, code: 'QT_START', detail: msg };
+  }
+});
+ipcMain.handle('qt:stop', async () => { if (qt) await qt.stop(); return { ok: true }; });
+
 ipcMain.handle('usb:driver', async () => {
   const src = app.isPackaged
     ? path.join(process.resourcesPath, 'zadig')
@@ -182,5 +205,5 @@ ipcMain.handle('pick-folder', async () => {
 });
 
 app.whenReady().then(createWindow);
-app.on('before-quit', stop);
+app.on('before-quit', () => { stop(); if (qt) qt.stop(); });
 app.on('window-all-closed', () => { stop(); app.quit(); });
