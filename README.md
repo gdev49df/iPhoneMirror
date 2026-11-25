@@ -20,4 +20,4 @@ Windows-приложение: показывает экран iPhone/iPad на �
 - Видео сейчас выводится окном UxPlay (GStreamer), а не внутри окна Electron.
 - Запись, скриншоты, трансляция в OBS.
 
-Создано @bauyrzhanov_12_
+Разработано GwebStudio

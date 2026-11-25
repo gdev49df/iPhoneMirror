@@ -64,20 +64,21 @@ async function listDevices() {
 function enableQuickTime(address, bus) {
   return new Promise((resolve) => {
     const dev = lib().getDeviceList().find((d) => d.deviceAddress === address && d.busNumber === bus);
-    if (!dev) return resolve({ ok: false, error: 'Устройство не найдено. Переподключи кабель.' });
+    if (!dev) return resolve({ ok: false, code: 'NOT_FOUND' });
     try {
       dev.open();
     } catch (e) {
       return resolve({
         ok: false,
         needDriver: true,
-        error: 'Не удалось открыть устройство по USB (нужен драйвер WinUSB/libusbK): ' + (e.message || e)
+        code: 'NEED_DRIVER',
+        detail: String(e.message || e)
       });
     }
     dev.controlTransfer(0x40, 0x52, 0x01, 0x02, Buffer.alloc(0), (err) => {
       try { dev.close(); } catch {}
       // после успешного запроса устройство само переподключается, ошибка тут возможна
-      resolve(err ? { ok: false, error: 'Запрос отклонён: ' + err.message } : { ok: true });
+      resolve(err ? { ok: false, code: 'REJECTED', detail: err.message } : { ok: true });
     });
   });
 }
