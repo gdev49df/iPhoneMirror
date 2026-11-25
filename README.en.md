@@ -1,3 +1,10 @@
+> **Fork notice.** This repository is a fork of [RayrenSX/iPhoneMirror](https://github.com/RayrenSX/iPhoneMirror)
+> (GPL-3.0-only). The original code, history, copyright notices and license are preserved unchanged.
+> Additions in this fork: [`electron-version/`](electron-version/), an independent Electron implementation of
+> iPhone mirroring (AirPlay via UxPlay, USB via a JavaScript port of the QuickTime protocol from
+> [quicktime_video_hack](https://github.com/danielpaulus/quicktime_video_hack), MIT). All credit for the original
+> project goes to its author. / Это форк проекта RayrenSX/iPhoneMirror; авторство, лицензия и история сохранены.
+
 <p align="center">
   <img src="src/App/Assets/iPhoneMirror.png" width="112" alt="iPhoneMirror icon">
 </p>
