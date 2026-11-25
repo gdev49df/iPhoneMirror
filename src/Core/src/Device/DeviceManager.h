@@ -1,0 +1,97 @@
+#pragma once
+
+#include "iPhoneMirror/CoreApi.h"
+#include "Protocol/Plist.h"
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace iPhoneMirror::device {
+
+struct DeviceRecord {
+    std::uint32_t device_id{};
+    std::uint16_t mux_port{};
+    ConnectionState state{ConnectionState::Disconnected};
+    bool usb_connected{};
+    bool pair_record_present{};
+    bool lockdown_accessible{};
+    std::wstring udid;
+    std::wstring name;
+    std::wstring product_type;
+    std::wstring device_color;
+    std::wstring enclosure_color;
+    std::wstring housing_color;
+    std::wstring os_version;
+    std::wstring connection_type;
+    std::wstring status;
+};
+
+namespace detail {
+
+// Lockdown returns these as either strings (names/hex/numeric codes) or integers.
+// Keep raw tokens: color codes are not portable between product generations.
+inline std::wstring device_color_token(const plist::Value* value) {
+    if (!value) return {};
+    std::string token;
+    if (value->type == plist::Type::String) token = value->string;
+    else if (value->type == plist::Type::Integer && value->integer >= 0)
+        token = std::to_string(value->integer);
+    if (token.size() > 31) return {};
+    for (unsigned char c : token) if (c < 0x20 || c > 0x7e) return {};
+    return std::wstring(token.begin(), token.end());
+}
+
+
+inline void preserve_cached_device_display_metadata(
+    DeviceRecord& target, const DeviceRecord& cached) {
+    target.name = cached.name;
+    target.product_type = cached.product_type;
+    target.device_color = cached.device_color;
+    target.enclosure_color = cached.enclosure_color;
+    target.housing_color = cached.housing_color;
+    target.os_version = cached.os_version;
+}
+
+[[nodiscard]] inline bool needs_device_metadata_refresh(
+    bool requested, const DeviceRecord& current, const DeviceRecord* cached,
+    bool active_session = false) noexcept {
+    return !active_session && (requested || !cached || !cached->lockdown_accessible ||
+        current.device_id != cached->device_id || current.mux_port != cached->mux_port);
+}
+
+} // namespace detail
+
+struct EnvironmentRecord {
+    bool service_installed{};
+    bool service_running{};
+    bool standard_mux{};
+    bool capture_mux{};
+    std::uint32_t physical_device_count{};
+    bool libusb_runtime{};
+    bool usbdk_backend_known{};
+    bool usbdk_backend{};
+    bool libusb_apple_devices_known{};
+    std::uint32_t libusb_apple_devices{};
+    bool libusb0_available{};
+    bool libusb0_apple_devices_known{};
+    std::uint32_t libusb0_apple_devices{};
+    std::wstring libusb_version;
+    std::wstring diagnostic;
+};
+
+class DeviceManager {
+public:
+    [[nodiscard]] EnvironmentRecord environment() const;
+    [[nodiscard]] std::vector<DeviceRecord> refresh(
+        bool refresh_metadata = false,
+        const std::vector<std::string>& excluded_identities = {});
+
+private:
+    std::mutex metadata_mutex_;
+    std::unordered_map<std::string, DeviceRecord> metadata_cache_;
+};
+
+} // namespace iPhoneMirror::device

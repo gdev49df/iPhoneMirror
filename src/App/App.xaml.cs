@@ -1,0 +1,328 @@
+using System.Windows;
+using IPhoneMirror.App.Localization;
+using IPhoneMirror.App.Services;
+using IPhoneMirror.App.Updater;
+using IPhoneMirror.App.ViewModels;
+using IPhoneMirror.App.Windows;
+using IPhoneMirror.SharedUI.Services;
+
+namespace IPhoneMirror.App;
+
+public partial class App : Application
+{
+    static App() => WpfLayoutCompatibility.Enable();
+
+    internal bool IsSystemSessionEnding { get; private set; }
+    internal bool IsUiPreviewMode { get; set; }
+    internal CompactLaunchOptions LaunchOptions { get; private set; } = new(false, null);
+    internal bool AutomationBackground { get; set; }
+    private readonly UpdateSettingsStore _settingsStore = new();
+    private GitHubReleaseClient? _releaseClient;
+    private GitHubReleaseClient ReleaseClient => _releaseClient ??= new();
+    private AboutWindow? _aboutWindow;
+    private UpdateWindow? _updateWindow;
+    private SingleInstanceCoordinator? _singleInstanceCoordinator;
+    private CompactLaunchChannel? _compactLaunchChannel;
+    private int _remoteShutdownRequested;
+    private bool _startupUpdateCheckStarted;
+
+    internal UpdateSettings UpdateSettings { get; private set; } = new();
+
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        if (IsUiPreviewMode)
+        {
+            base.OnStartup(e);
+            return;
+        }
+
+        // Keep WPF on its normal hardware-first composition path. Forcing the
+        // whole shell to SoftwareOnly also forces MediaElement composition and
+        // makes high-resolution media casting visibly drop frames. WPF still
+        // falls back to software automatically when the GPU path is not
+        // available; the native DirectComposition preview remains unaffected.
+        StartupDiagnostics.Initialize();
+        DispatcherUnhandledException += (_, args) =>
+        {
+            StartupDiagnostics.Write("WPF dispatcher", args.Exception);
+            // Only swallow known non-fatal UI exceptions (e.g. DragMove outside window).
+            if (args.Exception is InvalidOperationException)
+                args.Handled = true;
+            else
+                args.Handled = false; // let WPF terminate to avoid corrupt-state continuation
+        };
+        // Backstop for fire-and-forget tasks (`_ = SomeAsync()`): when such a
+        // Task is collected with an unobserved exception, log it and mark it
+        // observed so the process does not crash. This covers all call sites
+        // without needing to wrap each one individually.
+        TaskScheduler.UnobservedTaskException += (_, eventArgs) =>
+        {
+            DiagnosticLogger.Exception("async", "unobserved_task_exception",
+                eventArgs.Exception);
+            eventArgs.SetObserved();
+        };
+        try
+        {
+            DiagnosticLogger.Info("lifecycle", "startup_begin",
+                ("arguments", e.Args.Length));
+            LocalizationService.Initialize();
+            LaunchOptions = CompactLaunchOptions.Parse(e.Args);
+            AutomationBackground = LaunchOptions.AutomationBackground;
+            AppIdentity.Initialize();
+            UpdateSettings = _settingsStore.Load();
+            AppProxyPolicy.Apply(UpdateSettings.NetworkProxy);
+            RefreshInterfaceDescriptionVisibility();
+            ThemeService.Apply(UpdateSettings.Theme);
+            EventManager.RegisterClassHandler(typeof(Window), FrameworkElement.LoadedEvent,
+                new RoutedEventHandler((sender, _) =>
+                {
+                    var window = (Window)sender;
+                    ThemeService.Attach(window);
+                    BossKeyWindowVisibility.Apply(window);
+                }));
+            WindowWorkAreaController.EnableForApplication();
+            base.OnStartup(e);
+
+            _singleInstanceCoordinator = new SingleInstanceCoordinator();
+            if (!_singleInstanceCoordinator.OwnsPrimaryInstance ||
+                _singleInstanceCoordinator.HasPreExistingInstance())
+            {
+                if (LaunchOptions.Enabled && CompactLaunchChannel.ForwardAsync(LaunchOptions).GetAwaiter().GetResult())
+                {
+                    Shutdown(0);
+                    return;
+                }
+                DiagnosticLogger.Info("lifecycle", "instance_conflict_detected",
+                    ("owns_primary", _singleInstanceCoordinator.OwnsPrimaryInstance));
+                ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                var conflictWindow = new InstanceConflictWindow(_singleInstanceCoordinator);
+                AppIdentity.Attach(conflictWindow);
+                conflictWindow.ShowDialog();
+                if (!conflictWindow.ContinueWithCurrentInstance ||
+                    !_singleInstanceCoordinator.OwnsPrimaryInstance)
+                {
+                    Shutdown(0);
+                    return;
+                }
+            }
+
+            _singleInstanceCoordinator.StartShutdownListener(OnRemoteShutdownRequested);
+            ShutdownMode = ShutdownMode.OnLastWindowClose;
+            StartupDiagnostics.ValidateRequiredRuntime();
+            GitHubReleaseClient.CleanupInterruptedDownloads();
+            MainWindow = new MainWindow();
+            _compactLaunchChannel = new CompactLaunchChannel(options =>
+                Dispatcher.BeginInvoke(() =>
+                {
+                    if (MainWindow is MainWindow window)
+                    {
+                        if (options.AutomationBackground) _ = window.StartAutomationBackgroundAsync();
+                        else _ = window.OpenCompactRequestAsync(options);
+                    }
+                }));
+            if (LaunchOptions.Enabled)
+            {
+                MainWindow.ShowActivated = false;
+                MainWindow.WindowState = WindowState.Minimized;
+            }
+            AppIdentity.Attach(MainWindow);
+            ShowInitialWindow();
+            DiagnosticLogger.Info("lifecycle", "startup_complete");
+        }
+        catch (Exception error)
+        {
+            var logPath = StartupDiagnostics.Write("Application startup", error);
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            try { new StartupErrorWindow(error, logPath).ShowDialog(); }
+            catch (Exception dialogError)
+            {
+                DiagnosticLogger.Exception("startup", "error_dialog_failed",
+                    dialogError);
+            }
+            Shutdown(-1);
+        }
+    }
+
+    private void OnRemoteShutdownRequested()
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (Interlocked.Exchange(ref _remoteShutdownRequested, 1) != 0) return;
+            DiagnosticLogger.Info("lifecycle", "remote_shutdown_requested");
+            if (MainWindow is MainWindow main) main.ExitApplication();
+            else if (MainWindow is { } window) window.Close();
+            else Shutdown(0);
+        });
+    }
+
+    private void ShowInitialWindow()
+    {
+        if (AutomationBackground && MainWindow is MainWindow backgroundWindow)
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            _ = backgroundWindow.StartAutomationBackgroundAsync();
+            return;
+        }
+        var startProjection = false;
+        if (MainWindow is MainWindow setupWindow && !LaunchOptions.Enabled && new FirstRunSetupStore().Load().ShouldOpen)
+            startProjection = setupWindow.ShowFirstRunSetup();
+        if (MainWindow is MainWindow { IsTrayMode: true } trayWindow)
+            trayWindow.StartInTray();
+        else
+            MainWindow?.Show();
+        if (startProjection && MainWindow is MainWindow readyWindow) readyWindow.StartAfterSetup();
+        _ = CheckForStartupUpdatesAsync();
+    }
+
+    private async Task CheckForStartupUpdatesAsync()
+    {
+        if (_startupUpdateCheckStarted || !UpdateSettings.CheckOnStartup || LaunchOptions.Enabled) return;
+        _startupUpdateCheckStarted = true;
+        try
+        {
+            // Let the initial window or tray icon settle without depending on
+            // ContentRendered, which never fires for a hidden workspace.
+            await System.Windows.Threading.Dispatcher.Yield(
+                System.Windows.Threading.DispatcherPriority.Background);
+            var release = await CheckForUpdatesAsync(manual: false);
+            if (release is not null && MainWindow is not null && !Dispatcher.HasShutdownStarted)
+                ShowUpdateWindow(release, MainWindow, UpdateSettings.AutoDownload);
+        }
+        catch (Exception error)
+        {
+            // Startup update checks are best-effort and never block mirroring.
+            DiagnosticLogger.Exception("updater", "startup_check_failed", error);
+        }
+    }
+
+    internal async Task<ReleaseInfo?> CheckForUpdatesAsync(bool manual,
+        CancellationToken cancellationToken = default)
+    {
+        var settings = UpdateSettings.Clone();
+        if (manual && !settings.NotifyStableReleases &&
+            !settings.NotifyPrereleaseReleases)
+            settings.NotifyStableReleases = true;
+        var release = await ReleaseClient.GetLatestAsync(settings, cancellationToken);
+        if (release is null || release.Version <= VersionManager.Current)
+            return null;
+        return await ReleaseClient.EnrichReleaseNotesAsync(release, cancellationToken);
+    }
+
+    internal void ShowAboutWindow(Window owner, MainViewModel mainViewModel,
+        bool showDiagnostics = false)
+    {
+        if (_aboutWindow is not null)
+        {
+            if (showDiagnostics) _aboutWindow.ShowDiagnostics();
+            _aboutWindow.Activate();
+            return;
+        }
+        try
+        {
+            var window = new AboutWindow(this, mainViewModel) { Owner = owner };
+            _aboutWindow = window;
+            window.Closed += (_, _) => _aboutWindow = null;
+            if (showDiagnostics) window.ShowDiagnostics();
+            window.Show();
+        }
+        catch (Exception error)
+        {
+            DiagnosticLogger.Exception("ui", "about_window_open_failed", error);
+            AppPromptWindow.Inform(LocalizationService.Get("AboutTitle"),
+                LocalizationService.Get("GeneralOperationFailed"));
+        }
+    }
+
+    internal void ShowUpdateWindow(ReleaseInfo release, Window owner,
+        bool autoDownload)
+    {
+        if (_updateWindow is not null)
+        {
+            _updateWindow.Activate();
+            return;
+        }
+        var window = new UpdateWindow(release, ReleaseClient, autoDownload,
+            UpdateSettings.AllowMirrorFallback)
+        {
+            Owner = owner,
+        };
+        _updateWindow = window;
+        window.Closed += (_, _) => _updateWindow = null;
+        window.Show();
+    }
+
+    internal void ShowDeveloperUpdateWindow(Window owner)
+    {
+        var current = VersionManager.Current;
+        var previewVersion = new SemanticVersion(current.Major, current.Minor,
+            current.Patch + 1, "developer-preview");
+        var release = new ReleaseInfo(
+            $"v{previewVersion}", LocalizationService.Get("DeveloperPreviewUpdateTitle"),
+            LocalizationService.Get("DeveloperPreviewUpdateBody"),
+            DateTimeOffset.Now, previewVersion, true, null, null, null);
+        var window = new UpdateWindow(release, ReleaseClient, autoDownload: false,
+            allowMirrorFallback: false, readOnlyPreview: true)
+        {
+            Owner = owner,
+        };
+        window.Show();
+    }
+
+    internal bool SaveUpdateSettings()
+    {
+        if (IsUiPreviewMode) return true;
+        try
+        {
+            _settingsStore.Save(UpdateSettings);
+            return true;
+        }
+        catch (Exception error)
+        {
+            DiagnosticLogger.Exception("settings", "save_failed", error);
+            return false;
+        }
+    }
+
+    internal void RestoreUpdateSettings(UpdateSettings snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        UpdateSettings = snapshot.Clone();
+        RefreshInterfaceDescriptionVisibility();
+    }
+
+    internal void RefreshInterfaceDescriptionVisibility(bool? hidden = null) =>
+        Resources["InterfaceDescriptionsVisibility"] = (hidden ??
+            (UpdateSettings.ApplicationDisplayMode != ApplicationDisplayMode.Complete || UpdateSettings.HideInterfaceDescriptions))
+            ? Visibility.Collapsed : Visibility.Visible;
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        if (IsUiPreviewMode)
+        {
+            ThemeService.Shutdown();
+            base.OnExit(e);
+            return;
+        }
+
+        _ = SaveUpdateSettings();
+        ThemeService.Shutdown();
+        try { _releaseClient?.Dispose(); }
+        catch (Exception error)
+        {
+            DiagnosticLogger.Exception("updater", "client_dispose_failed", error);
+        }
+        _singleInstanceCoordinator?.Dispose();
+        _compactLaunchChannel?.Dispose();
+        _singleInstanceCoordinator = null;
+        DiagnosticLogger.Shutdown(e.ApplicationExitCode);
+        base.OnExit(e);
+    }
+
+    protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
+    {
+        IsSystemSessionEnding = true;
+        DiagnosticLogger.Info("shutdown", "windows_session_ending",
+            ("reason", e.ReasonSessionEnding));
+        base.OnSessionEnding(e);
+    }
+}

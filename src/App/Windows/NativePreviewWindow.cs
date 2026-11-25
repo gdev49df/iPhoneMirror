@@ -1,0 +1,1883 @@
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Threading;
+using IPhoneMirror.App.Controls;
+using IPhoneMirror.App.Interop;
+using IPhoneMirror.App.Localization;
+using IPhoneMirror.App.Services;
+
+namespace IPhoneMirror.App.Windows;
+
+/// <summary>
+/// Native top-level DirectComposition preview. WS_EX_NOREDIRECTIONBITMAP keeps
+/// DWM from allocating a second WPF redirection surface, allowing the native
+/// renderer to attach its visual tree directly to this HWND.
+/// </summary>
+internal sealed class NativePreviewWindow : IDisposable
+{
+    internal const string StableTitle = "iPhoneMirror OBS Preview";
+    private static readonly HashSet<NativePreviewWindow> OpenWindows = [];
+    private static int BossKeyHidden;
+
+    private const int WmNcCalcSize = 0x0083;
+    private const int WmNcHitTest = 0x0084;
+    private const int WmContextMenu = 0x007B;
+    private const int WmNcLeftButtonDoubleClick = 0x00A3;
+    private const int WmNcRightButtonDown = 0x00A4;
+    private const int WmNcRightButtonUp = 0x00A5;
+    private const int WmRightButtonDown = 0x0204;
+    private const int WmRightButtonUp = 0x0205;
+    private const int WmLeftButtonDoubleClick = 0x0203;
+    private const int WmClose = 0x0010;
+    private const int WmEraseBackground = 0x0014;
+    private const int WmMouseMove = 0x0200;
+    private const uint PmRemove = 0x0001;
+    private const int WmLeftButtonDown = 0x0201;
+    private const int WmLeftButtonUp = 0x0202;
+    private const int WmMiddleButtonDown = 0x0207;
+    private const int WmMiddleButtonUp = 0x0208;
+    private const int WmXButtonDown = 0x020B;
+    private const int WmXButtonUp = 0x020C;
+    private const int WmMouseWheel = 0x020A;
+    private const int WmSetCursor = 0x0020;
+    private const int WmKillFocus = 0x0008;
+    private const int WmCancelMode = 0x001F;
+    private const int WmActivateApp = 0x001C;
+    private const int WmActivate = 0x0006;
+    private const int WmCaptureChanged = 0x0215;
+    private const int WmSetIcon = 0x0080;
+    private const int WmKeyDown = 0x0100;
+    private const int WmKeyUp = 0x0101;
+    private const int WmSysKeyDown = 0x0104;
+    private const int WmSysKeyUp = 0x0105;
+    private const int WmDpiChanged = 0x02E0;
+    // Shared with the native D3D11 preview. Properties carry packed source dimensions.
+    private const int WmPreviewGeometryChanged = 0x8140;
+    private const string PendingPreviewGeometry = "iPhoneMirrorPendingPreviewGeometry";
+    private const string AppliedPreviewGeometry = "iPhoneMirrorAppliedPreviewGeometry";
+    private const int VkEscape = 0x1B;
+    private const int VkReturn = 0x0D;
+    private const int VkF11 = 0x7A;
+    private const int VkShift = 0x10;
+    private const int VkControl = 0x11;
+    private const int VkMenu = 0x12;
+    private const int HtClient = 1;
+    private const int HtCaption = 2;
+    private const int HtLeft = 10;
+    private const int HtRight = 11;
+    private const int HtTop = 12;
+    private const int HtTopLeft = 13;
+    private const int HtTopRight = 14;
+    private const int HtBottom = 15;
+    private const int HtBottomLeft = 16;
+    private const int HtBottomRight = 17;
+    private const int GwlStyle = -16;
+    private const int GwlExStyle = -20;
+    private const int WsExLayered = 0x00080000;
+    private const uint LwaAlpha = 0x00000002;
+    private const int WsPopup = unchecked((int)0x80000000);
+    private const int WsCaption = 0x00C00000;
+    private const int WsClipChildren = 0x02000000;
+    private const int WsClipSiblings = 0x04000000;
+    private const int WsThickFrame = 0x00040000;
+    private const int WsSysMenu = 0x00080000;
+    private const int WsMinimizeBox = 0x00020000;
+    private const int WsMaximizeBox = 0x00010000;
+    private const int WsExAppWindow = 0x00040000;
+    private const int WsExNoRedirectionBitmap = 0x00200000;
+
+    private const int SwHide = 0;
+    private const int SwShow = 5;
+    private const int SwRestore = 9;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoZOrder = 0x0004;
+    private const uint SwpNoActivate = 0x0010;
+    private const uint SwpFrameChanged = 0x0020;
+    private const uint SwpShowWindow = 0x0040;
+    private const uint MonitorDefaultToNearest = 2;
+    private const uint CursorShowing = 0x00000001;
+    private static readonly nint HwndTopMost = new(-1);
+    private static readonly nint HwndNoTopMost = new(-2);
+
+    private const int DwmUseImmersiveDarkMode = 20;
+    private const int DwmWindowCornerPreference = 33;
+    private const int DwmBorderColor = 34;
+    private const int DwmDoNotRound = 1;
+    private const int DwmRound = 2;
+    private const uint DwmColorNone = 0xFFFFFFFE;
+
+    private readonly HwndSource _source;
+    private readonly AspectRatioWindowController _aspectController;
+    private Func<nint, bool> _attachPreview;
+    private Action<nint> _detachPreview;
+    private Func<nint, bool> _refreshPreview;
+    private readonly Func<ulong, nint, double, double, bool> _setCornerProfile;
+    private readonly ContextMenu _contextMenu;
+    private readonly MenuItem _fullScreenItem;
+    private readonly MenuItem _windowMenuItem;
+    private readonly MenuItem _displayMenuItem;
+    private readonly MenuItem _topMostItem;
+    private readonly MenuItem _fixedItem;
+    private readonly MenuItem _styleItem;
+    private readonly MenuItem? _reverseControlMenuItem;
+    private readonly MenuItem? _bluetoothControlItem;
+    private readonly MenuItem? _usbControlItem;
+    private readonly MenuItem? _wirelessControlItem;
+    private readonly MenuItem? _cornerItem;
+    private readonly MenuItem _muteMenuItem;
+    private readonly MenuItem _muteThisItem;
+    private readonly MenuItem _muteOthersItem;
+    private readonly MenuItem _rotateLeftItem;
+    private readonly MenuItem _rotateRightItem;
+    private readonly MenuItem _closeItem;
+    private readonly MenuItem? _imageSettingsItem;
+    private readonly MenuItem? _projectionSettingsItem;
+    private readonly Func<bool>? _isAudioEnabled;
+    private readonly Func<int>? _connectedDeviceCount;
+    private readonly Action<bool>? _setAudioEnabled;
+    private readonly Action? _muteOtherWindows;
+    private readonly Action<nint>? _showImageSettings;
+    private readonly Action? _showProjectionSettings;
+    private readonly Func<nint, bool>? _isReverseControlEnabled;
+    private readonly Action<PreviewPointerEventArgs>? _pointerInput;
+    private readonly Action<PreviewKeyboardEventArgs>? _keyboardInput;
+    private readonly Action<nint>? _requestReverseControl;
+    private readonly Func<bool>? _isUsbControlEnabled;
+    private readonly Action<nint>? _requestUsbControl;
+    private readonly Action<nint>? _requestWirelessControl;
+    private readonly Action<string>? _logDiagnostic;
+    private ulong _sessionHandle;
+    private double _cornerRadius;
+    private double _cornerExponent;
+    private readonly Border? _managedContentRoot;
+    private readonly FrameworkElement? _managedContent;
+    private readonly Transform? _managedContentOriginalLayoutTransform;
+    private readonly Action? _managedContentDetached;
+    private uint _sourceWidth;
+    private uint _sourceHeight;
+    private bool _hasRendererDimensions;
+    private nint _handle;
+    private bool _attached;
+    private bool _isFullScreen;
+    private bool _disposed;
+    private bool _closeQueued;
+    private bool _isTopMost;
+    private bool _isFixed;
+    private bool _cornersEnabled = true;
+    private bool _phoneFramePreferred;
+    private bool _phoneFrameEnabled;
+    private DeviceFrameHitTest? _phoneFrameHitTest;
+    internal string? DeviceProductType { get; private set; }
+    private DeviceAppearance _deviceAppearance = DeviceAppearance.Unknown;
+    private DeviceFrameSelection FrameSelection { get; set; } = new(null, "black", false);
+    private DeviceFrameProfile? DeviceFrame => FrameSelection.Profile;
+
+    internal bool UpdateDeviceAppearance(string? productType, DeviceAppearance appearance)
+    {
+        var previous = DeviceFrame;
+        var selection = DeviceFrameCatalog.Resolve(productType, appearance, _sourceWidth, _sourceHeight);
+        if (DeviceProductType == productType && _deviceAppearance == appearance && previous == selection.Profile)
+        {
+            UpdateDeviceCornerProfile();
+            return true;
+        }
+        var next = selection.Profile;
+        var hitTest = _phoneFrameHitTest;
+        var frameRemoved = false;
+        if (_phoneFrameEnabled && previous != next)
+        {
+            if (next is null)
+            {
+                if (!ApplyPhoneFrame(false, notify: false)) return false;
+                hitTest = null;
+                frameRemoved = true;
+            }
+            else
+            {
+                hitTest = new DeviceFrameHitTest(next);
+                if (!NativeCore.SetDeviceWindowFrameArtwork(_sessionHandle, _handle, next)) return false;
+            }
+        }
+        DeviceProductType = productType;
+        _deviceAppearance = appearance;
+        FrameSelection = selection;
+        _phoneFrameHitTest = hitTest;
+        UpdateDeviceCornerProfile();
+        if (previous != next)
+        {
+            if (_phoneFrameEnabled) ApplyRotatedDimensions();
+            else if (next is not null && EffectivePhoneFrame && !ApplyPhoneFrame(true, notify: true)) return false;
+        }
+        if (_styleWindow is not null) _styleWindow.SetPhoneFrameDescription(PhoneFrameDescription);
+        if (frameRemoved) PhoneFrameChanged?.Invoke();
+        return true;
+    }
+
+    private void UpdateDeviceCornerProfile()
+    {
+        if (_managedContent is not null) return;
+        var profile = DeviceCornerProfileResolver.Resolve(DeviceProductType, _sourceWidth, _sourceHeight);
+        var radius = profile.IsRounded ? profile.RadiusRatio : 0;
+        if (_cornerRadius == radius && _cornerExponent == profile.CurveExponent) return;
+        _cornerRadius = radius;
+        _cornerExponent = profile.CurveExponent;
+        // Refresh the model/panel fit without changing the user's per-window
+        // remove-corners choice. The native frame/full-screen flags remain
+        // responsible for whether this base outline is currently displayed.
+        _ = _setCornerProfile(_sessionHandle, _handle,
+            _cornersEnabled ? _cornerRadius : 0, _cornerExponent);
+    }
+
+    internal string PhoneFrameDescription => LocalizationService.Get("ProjectionPhoneFrameHelp") + " " + DeviceFrameCatalog.Describe(FrameSelection);
+    internal void RefreshPhoneFrameDescription() => _styleWindow?.SetPhoneFrameDescription(PhoneFrameDescription);
+    internal DeviceFrameProfile? ActiveDeviceFrame => _phoneFrameEnabled && !_isFullScreen && !IsZoomed(_handle) ? DeviceFrame : null;
+    private int DefaultFrameRotation => (_rotation + (_sourceWidth > _sourceHeight ? 1 : 0)) % 4;
+    internal int DeviceFrameRotation
+    {
+        get
+        {
+            var orientation = NativeCore.GetDeviceWindowPhoneFrameOrientation(_sessionHandle, _handle);
+            return orientation >= 0 && (orientation & 1) == (DefaultFrameRotation & 1)
+                ? orientation : DefaultFrameRotation;
+        }
+    }
+    private int _rotation;
+    private byte _capturedMouseButtons;
+    private nint _largeIcon;
+    private nint _smallIcon;
+    private ProtectedContentOverlayWindow? _protectedOverlay;
+    private WindowStyleSettingsWindow? _styleWindow;
+    private double _windowOpacity = 1.0;
+    private readonly Dictionary<Guid, (PreviewShortcutSetting Setting, double Value, long Order)> _temporarySettings = [];
+    private long _temporarySettingOrder;
+    private double _appliedOpacity = 1.0;
+    private bool _opaqueOnHover;
+    private bool _isPointerOverWindow;
+    private readonly NativePreviewMouse _windowMouse = new();
+    internal bool BluetoothWindowMouseEnabled { get; set; }
+    private bool UsesBluetoothWindowMouse => BluetoothWindowMouseEnabled && !IsUsbControlEnabledForWindow;
+    private readonly DispatcherTimer _hoverOpacityTimer = new()
+    {
+        Interval = TimeSpan.FromMilliseconds(80),
+    };
+    private WindowRect _restoreRectangle;
+    private nint _restoreStyle;
+
+    internal bool IsFullScreen => _isFullScreen;
+    private bool UsesWindowPointerControl => IsUsbControlEnabledForWindow || UsesBluetoothWindowMouse;
+    // Position-based control shares the drag surface. Unfixing gives it back to Windows,
+    // including keyboard input admitted through the global hook.
+    internal bool AllowsControlInput => !UsesWindowPointerControl || _isFixed || _isFullScreen;
+    internal event Action<bool>? FullScreenChanged;
+
+    private NativePreviewWindow(uint sourceWidth, uint sourceHeight, string title,
+        Func<nint, bool> attachPreview, Action<nint> detachPreview,
+        Func<nint, bool> refreshPreview, ulong sessionHandle,
+         double cornerRadius, double cornerExponent,
+         Func<bool>? isAudioEnabled = null, Func<int>? connectedDeviceCount = null,
+         Action<bool>? setAudioEnabled = null, Action? muteOtherWindows = null,
+          Action<nint>? showImageSettings = null, Action? showProjectionSettings = null,
+           Func<nint, bool>? isReverseControlEnabled = null,
+           Action<PreviewPointerEventArgs>? pointerInput = null,
+           Action<PreviewKeyboardEventArgs>? keyboardInput = null,
+           Action<nint>? requestReverseControl = null,
+           Func<bool>? isUsbControlEnabled = null,
+           Action<nint>? requestUsbControl = null,
+           Action<nint>? requestWirelessControl = null,
+           FrameworkElement? managedContent = null, Action? managedContentDetached = null,
+         Action<string>? logDiagnostic = null,
+         Func<ulong, nint, double, double, bool>? setCornerProfile = null)
+    {
+        _attachPreview = attachPreview;
+        _detachPreview = detachPreview;
+        _refreshPreview = refreshPreview;
+        _setCornerProfile = setCornerProfile ?? NativeCore.SetDeviceWindowCornerProfile;
+        _sessionHandle = sessionHandle;
+        _cornerRadius = cornerRadius;
+        _cornerExponent = cornerExponent;
+        _isAudioEnabled = isAudioEnabled;
+        _connectedDeviceCount = connectedDeviceCount;
+        _setAudioEnabled = setAudioEnabled;
+        _muteOtherWindows = muteOtherWindows;
+        _showImageSettings = showImageSettings;
+        _showProjectionSettings = showProjectionSettings;
+        _isReverseControlEnabled = isReverseControlEnabled;
+        _pointerInput = pointerInput;
+        _keyboardInput = keyboardInput;
+        _requestReverseControl = requestReverseControl;
+        _isUsbControlEnabled = isUsbControlEnabled;
+        _requestUsbControl = requestUsbControl;
+        _requestWirelessControl = requestWirelessControl;
+        _logDiagnostic = logDiagnostic;
+        _managedContent = managedContent;
+        _managedContentOriginalLayoutTransform = managedContent?.LayoutTransform;
+        _managedContentDetached = managedContentDetached;
+        _sourceWidth = sourceWidth;
+        _sourceHeight = sourceHeight;
+        _hoverOpacityTimer.Tick += (_, _) => UpdateHoverState(IsPointerOverPreview());
+        _contextMenu = new ContextMenu
+        {
+            Style = (Style)Application.Current.FindResource("DeviceContextMenuStyle"),
+            Placement = PlacementMode.MousePoint,
+        };
+        var itemStyle = (Style)Application.Current.FindResource("DeviceMenuItemStyle");
+        var submenuStyle = (Style)Application.Current.FindResource("DeviceSubmenuItemStyle");
+        _fullScreenItem = new MenuItem { Style = itemStyle };
+        _fullScreenItem.Click += (_, _) => ToggleFullScreen();
+        _windowMenuItem = new MenuItem { Style = submenuStyle };
+        _topMostItem = new MenuItem { Style = itemStyle };
+        _topMostItem.Click += (_, _) => ToggleTopMost();
+        _fixedItem = new MenuItem { Style = itemStyle };
+        _fixedItem.Click += (_, _) => ToggleFixedWindow();
+        _styleItem = new MenuItem { Style = itemStyle };
+        _styleItem.Click += (_, _) => ShowStyleSettings();
+        if (_requestReverseControl is not null)
+        {
+            _reverseControlMenuItem = new MenuItem { Style = submenuStyle };
+            _bluetoothControlItem = new MenuItem { Style = itemStyle };
+            _bluetoothControlItem.Click += (_, _) => EnableReverseControl();
+            _reverseControlMenuItem.Items.Add(_bluetoothControlItem);
+        }
+        if (_requestUsbControl is not null)
+        {
+            _usbControlItem = new MenuItem { Style = itemStyle };
+            _usbControlItem.Click += (_, _) => _requestUsbControl(_handle);
+            _reverseControlMenuItem?.Items.Add(_usbControlItem);
+        }
+        if (_requestWirelessControl is not null)
+        {
+            _wirelessControlItem = new MenuItem { Style = itemStyle };
+            _wirelessControlItem.Click += (_, _) => _requestWirelessControl(_handle);
+            _reverseControlMenuItem?.Items.Add(_wirelessControlItem);
+        }
+        _windowMenuItem.Items.Add(_topMostItem);
+        _windowMenuItem.Items.Add(_fixedItem);
+        _windowMenuItem.Items.Add(_styleItem);
+        _displayMenuItem = new MenuItem { Style = submenuStyle };
+        _muteMenuItem = new MenuItem { Style = submenuStyle };
+        _muteThisItem = new MenuItem { Style = itemStyle };
+        _muteThisItem.Click += (_, _) => ToggleWindowAudio();
+        _muteOthersItem = new MenuItem { Style = itemStyle };
+        _muteOthersItem.Click += (_, _) => MuteOtherWindows();
+        _muteMenuItem.Items.Add(_muteThisItem);
+        _muteMenuItem.Items.Add(_muteOthersItem);
+        _rotateLeftItem = new MenuItem { Style = itemStyle };
+        _rotateLeftItem.Click += (_, _) => Rotate(-1);
+        _rotateRightItem = new MenuItem { Style = itemStyle };
+        _rotateRightItem.Click += (_, _) => Rotate(1);
+        _closeItem = new MenuItem { Style = itemStyle };
+        _closeItem.Click += (_, _) => QueueClose();
+        if (managedContent is null)
+        {
+            _cornerItem = new MenuItem { Style = itemStyle };
+            _cornerItem.Click += (_, _) => ToggleCorners();
+            if (_showImageSettings is not null)
+            {
+                _imageSettingsItem = new MenuItem { Style = itemStyle };
+                _imageSettingsItem.Click += (_, _) => ShowImageSettings();
+                _displayMenuItem.Items.Add(_imageSettingsItem);
+            }
+            _displayMenuItem.Items.Add(_cornerItem);
+            if (_showProjectionSettings is not null)
+            {
+                _projectionSettingsItem = new MenuItem { Style = itemStyle };
+                _projectionSettingsItem.Click += (_, _) => ShowProjectionSettings();
+            }
+        }
+        _displayMenuItem.Items.Add(_rotateLeftItem);
+        _displayMenuItem.Items.Add(_rotateRightItem);
+        _contextMenu.Items.Add(_fullScreenItem);
+        _contextMenu.Items.Add(_windowMenuItem);
+        _contextMenu.Items.Add(_displayMenuItem);
+        if (_reverseControlMenuItem is not null) _contextMenu.Items.Add(_reverseControlMenuItem);
+        if (_setAudioEnabled is not null) _contextMenu.Items.Add(_muteMenuItem);
+        if (_projectionSettingsItem is not null) _contextMenu.Items.Add(_projectionSettingsItem);
+        _contextMenu.Items.Add(new Separator
+        {
+            Style = (Style)Application.Current.FindResource("DeviceMenuSeparatorStyle"),
+        });
+        _contextMenu.Items.Add(_closeItem);
+        UpdateContextMenuLabels();
+        var windowTitle = string.IsNullOrWhiteSpace(title) ? StableTitle : title;
+        var parameters = new HwndSourceParameters(windowTitle)
+        {
+            Width = 720,
+            Height = 900,
+            PositionX = 0,
+            PositionY = 0,
+            WindowStyle = managedContent is null
+                ? WsPopup | WsThickFrame | WsSysMenu | WsMinimizeBox |
+                    WsClipChildren | WsClipSiblings
+                : WsCaption | WsThickFrame | WsSysMenu | WsMinimizeBox |
+                    WsMaximizeBox | WsClipChildren | WsClipSiblings,
+            ExtendedWindowStyle = WsExAppWindow |
+                (managedContent is null ? WsExNoRedirectionBitmap : 0),
+            TreatAsInputRoot = true,
+        };
+        _source = new HwndSource(parameters);
+        _handle = _source.Handle;
+        if (_handle == 0) throw new InvalidOperationException(
+            "Could not create the native preview window.");
+        if (managedContent is null) NativeTouchInput.RegisterTouchWindow(_handle);
+
+        if (managedContent is not null)
+        {
+            _managedContentRoot = new Border
+            {
+                Background = Brushes.Black,
+                Child = managedContent,
+                ClipToBounds = true,
+            };
+            _source.RootVisual = _managedContentRoot;
+        }
+
+        _ = SetWindowTextW(_handle, windowTitle);
+        ApplyApplicationIcons();
+        if (managedContent is null)
+        {
+            var cornerPreference = DwmDoNotRound;
+            _ = DwmSetWindowAttribute(_handle, DwmWindowCornerPreference,
+                ref cornerPreference, sizeof(int));
+            var borderColor = DwmColorNone;
+            _ = DwmSetWindowAttributeColor(_handle, DwmBorderColor,
+                ref borderColor, sizeof(uint));
+        }
+        else
+        {
+            // Media-cast content uses a normal captioned HWND. Explicitly ask
+            // DWM for the Windows default corner treatment so it remains
+            // rounded even when the app's theme changes window preferences.
+            var cornerPreference = DwmRound;
+            _ = DwmSetWindowAttribute(_handle, DwmWindowCornerPreference,
+                ref cornerPreference, sizeof(int));
+            var darkTitleBar = ThemeService.IsDark ? 1 : 0;
+            _ = DwmSetWindowAttribute(_handle, DwmUseImmersiveDarkMode,
+                ref darkTitleBar, sizeof(int));
+        }
+
+        _aspectController = new AspectRatioWindowController(_source,
+            sourceWidth, sourceHeight,
+            () => !_disposed && !_isFullScreen && _handle != 0 &&
+                !IsIconic(_handle) && !IsZoomed(_handle),
+            minWidthDips: 96, minHeightDips: 96);
+        // Install the instance hook only after every callback dependency is
+        // initialized; HwndSource construction itself dispatches messages.
+        _source.AddHook(WindowProcedure);
+        if (managedContent is null && _sessionHandle != 0)
+            _ = SetPropW(_handle, AppliedPreviewGeometry, (nint)1);
+        OpenWindows.Add(this);
+        ThemeService.ThemeChanged += OnThemeChanged;
+        if (managedContent is null)
+        {
+            // Preserve the original borderless DirectComposition window for
+            // wired/wireless mirroring. Video casting alone uses system chrome.
+            _ = SetWindowPos(_handle, 0, 0, 0, 0, 0,
+                SwpNoSize | SwpNoMove | SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
+        }
+        Log("independent_window_created",
+            ("mode", WindowMode), ("handle", AppLog.Handle(_sessionHandle)),
+            ("size", $"{sourceWidth}x{sourceHeight}"),
+            ("title_bar", managedContent is not null));
+    }
+
+    internal event EventHandler? Closed;
+    internal event Action<bool>? ActivationChanged;
+    internal ulong SessionHandle => _sessionHandle;
+    internal nint Handle => _handle;
+    internal (uint Width, uint Height, int Rotation) ControlGeometry =>
+        (_rotation & 1) == 0
+            ? (_sourceWidth, _sourceHeight, _rotation)
+            : (_sourceHeight, _sourceWidth, _rotation);
+
+    internal bool RebindSession(ulong sessionHandle)
+    {
+        if (_disposed || _managedContent is not null || _handle == 0 || sessionHandle == 0)
+            return false;
+
+        var previousHandle = _sessionHandle;
+        if (_attached)
+        {
+            try { _detachPreview(_handle); }
+            catch { /* The old native session may already be gone. */ }
+            _attached = false;
+        }
+
+        _sessionHandle = sessionHandle;
+        _hasRendererDimensions = false;
+        _ = RemovePropW(_handle, PendingPreviewGeometry);
+        _ = SetPropW(_handle, AppliedPreviewGeometry, (nint)1);
+        _attachPreview = hwnd => NativeCore.AttachDevicePreview(sessionHandle, hwnd);
+        _detachPreview = hwnd => NativeCore.DetachDevicePreview(sessionHandle, hwnd);
+        _refreshPreview = hwnd => NativeCore.AttachDevicePreview(sessionHandle, hwnd);
+        if (!_attachPreview(_handle))
+        {
+            Log("independent_window_rebind_failed",
+                ("mode", WindowMode), ("old_handle", AppLog.Handle(previousHandle)),
+                ("new_handle", AppLog.Handle(sessionHandle)));
+            return false;
+        }
+
+        _attached = true;
+        if (_phoneFrameEnabled && DeviceFrame is { } frame)
+            _ = NativeCore.SetDeviceWindowFrameArtwork(sessionHandle, _handle, frame);
+        _ = NativeCore.SetDeviceWindowPhoneFrame(sessionHandle, _handle, _phoneFrameEnabled);
+        _ = _setCornerProfile(sessionHandle, _handle,
+            _cornersEnabled ? _cornerRadius : 0, _cornerExponent);
+        if (_rotation != 0)
+            _ = NativeCore.SetDeviceWindowRotation(sessionHandle, _handle, _rotation);
+        _ = ApplyWindowOpacity(EffectiveWindowOpacity, force: true);
+        Log("independent_window_rebound",
+            ("mode", WindowMode), ("old_handle", AppLog.Handle(previousHandle)),
+            ("new_handle", AppLog.Handle(sessionHandle)));
+        return true;
+    }
+
+    private string WindowMode => _managedContent is null ? "device" : "media_cast";
+
+    private void Log(string eventName, params (string Key, object? Value)[] fields)
+    {
+        try
+        {
+            _logDiagnostic?.Invoke(AppLog.Event(eventName,
+                fields.Select(field => (object?)field).ToArray()));
+        }
+        catch (Exception error)
+        {
+            // Diagnostics must never interfere with HWND ownership or teardown.
+            DiagnosticLogger.ExceptionOnce("preview-log-callback", "logging",
+                "preview_log_callback_failed", error);
+        }
+    }
+
+    internal static bool TryCreateAndShowForSession(ulong handle, uint sourceWidth,
+        uint sourceHeight, string title, double cornerRadius, double cornerExponent,
+        Func<bool> isAudioEnabled, Func<int> connectedDeviceCount,
+        Action<bool> setAudioEnabled, Action muteOtherWindows,
+        Action<nint> showImageSettings, Action showProjectionSettings,
+        out NativePreviewWindow? window, Action<string>? logDiagnostic = null,
+        Func<nint, bool>? isReverseControlEnabled = null,
+        Action<PreviewPointerEventArgs>? pointerInput = null,
+        Action<PreviewKeyboardEventArgs>? keyboardInput = null,
+        Action<nint>? requestReverseControl = null,
+        Func<bool>? isUsbControlEnabled = null,
+        Action<nint>? requestUsbControl = null,
+        Action<nint>? requestWirelessControl = null,
+        Action<NativePreviewWindow>? beforeShow = null)
+    {
+        window = null;
+        NativePreviewWindow? candidate = null;
+        try
+        {
+            candidate = new NativePreviewWindow(sourceWidth, sourceHeight, title,
+                hwnd => NativeCore.AttachDevicePreview(handle, hwnd),
+                hwnd => NativeCore.DetachDevicePreview(handle, hwnd),
+                hwnd => NativeCore.AttachDevicePreview(handle, hwnd),
+                 handle, cornerRadius, cornerExponent, isAudioEnabled,
+                 connectedDeviceCount, setAudioEnabled, muteOtherWindows,
+                  showImageSettings, showProjectionSettings,
+                  isReverseControlEnabled, pointerInput, keyboardInput, requestReverseControl,
+                  isUsbControlEnabled, requestUsbControl,
+                  requestWirelessControl,
+                  logDiagnostic: logDiagnostic);
+            if (!candidate._attachPreview(candidate._handle))
+            {
+                logDiagnostic?.Invoke(AppLog.Event("independent_window_attach_failed",
+                    ("mode", "device"), ("handle", AppLog.Handle(handle))));
+                candidate.Dispose();
+                return false;
+            }
+            candidate._attached = true;
+            beforeShow?.Invoke(candidate);
+            candidate.ShowInitially();
+            if (Volatile.Read(ref BossKeyHidden) != 0)
+                candidate.SetBossKeyHidden(true);
+            else
+                _ = SetForegroundWindow(candidate._handle);
+            window = candidate;
+            logDiagnostic?.Invoke(AppLog.Event("independent_window_shown",
+                ("mode", "device"), ("handle", AppLog.Handle(handle))));
+            return true;
+        }
+        catch (Exception error)
+        {
+            logDiagnostic?.Invoke(AppLog.Event("independent_window_create_failed",
+                ("mode", "device"), ("handle", AppLog.Handle(handle)),
+                ("error", AppLog.Error(error))));
+            candidate?.Dispose();
+            return false;
+        }
+    }
+
+    internal static bool TryCreateAndShowForContent(FrameworkElement content,
+        uint sourceWidth, uint sourceHeight, string title,
+        Func<bool> isAudioEnabled, Action<bool> setAudioEnabled,
+        Func<int> connectedDeviceCount, Action muteOtherWindows,
+        Action contentDetached, out NativePreviewWindow? window,
+        Action<string>? logDiagnostic = null)
+    {
+        window = null;
+        NativePreviewWindow? candidate = null;
+        try
+        {
+            candidate = new NativePreviewWindow(sourceWidth, sourceHeight, title,
+                _ => true, _ => { }, _ =>
+                 {
+                     content.InvalidateVisual();
+                     return true;
+                 }, 0, 0, 1, isAudioEnabled, connectedDeviceCount, setAudioEnabled,
+                 muteOtherWindows, null, null,
+                 managedContent: content, managedContentDetached: contentDetached,
+                 logDiagnostic: logDiagnostic);
+            candidate._attached = true;
+            candidate.ShowInitially();
+            if (Volatile.Read(ref BossKeyHidden) != 0)
+                candidate.SetBossKeyHidden(true);
+            else
+                _ = SetForegroundWindow(candidate._handle);
+            window = candidate;
+            logDiagnostic?.Invoke(AppLog.Event("independent_window_shown",
+                ("mode", "media_cast"), ("handle", AppLog.Handle(0))));
+            return true;
+        }
+        catch (Exception error)
+        {
+            logDiagnostic?.Invoke(AppLog.Event("independent_window_create_failed",
+                ("mode", "media_cast"), ("error", AppLog.Error(error))));
+            if (candidate is not null) candidate.Dispose();
+            else
+            {
+                if (content.Parent is Decorator owner) owner.Child = null;
+                contentDetached();
+            }
+            return false;
+        }
+    }
+
+    private void ShowInitially()
+    {
+        var boundsApplied = _aspectController.ApplyInitialBounds();
+        _isTopMost = false;
+        if (!SetWindowPos(_handle, HwndNoTopMost, 0, 0, 0, 0,
+                SwpNoSize | SwpNoMove | SwpNoActivate | SwpShowWindow))
+        {
+            // Keep the window usable if the combined show/z-order operation is
+            // rejected by the shell. Its final bounds were already applied
+            // while hidden, so this fallback still cannot expose a move.
+            _ = ShowWindow(_handle, SwShow);
+            _ = SetWindowPos(_handle, HwndNoTopMost, 0, 0, 0, 0,
+                SwpNoSize | SwpNoMove | SwpNoActivate);
+        }
+        Log("independent_window_initial_layout",
+            ("mode", WindowMode), ("bounds_applied", boundsApplied),
+            ("top_most", _isTopMost));
+    }
+
+    internal void Activate()
+    {
+        if (_disposed || _handle == 0) return;
+        if (IsIconic(_handle)) _ = ShowWindow(_handle, SwRestore);
+        else _ = ShowWindow(_handle, SwShow);
+        if (!_attached && _attachPreview(_handle))
+            _attached = true;
+        else if (_attached)
+            _ = _attachPreview(_handle);
+        if (EffectiveWindowOpacity < 1.0) _ = ApplyWindowOpacity(EffectiveWindowOpacity, force: true);
+        _ = SetForegroundWindow(_handle);
+        _ = SetFocus(_handle);
+        Log("independent_window_activated",
+            ("mode", WindowMode), ("attached", _attached),
+            ("full_screen", _isFullScreen));
+    }
+
+    internal void HideForShutdown()
+    {
+        if (_disposed || _handle == 0) return;
+        _styleWindow?.Close();
+        _contextMenu.IsOpen = false;
+        _contextMenu.PlacementTarget = null;
+        _ = ShowWindow(_handle, SwHide);
+    }
+
+    internal void SetBossKeyHidden(bool hidden)
+    {
+        if (_disposed || _handle == 0) return;
+        if (hidden)
+        {
+            _styleWindow?.Close();
+            _contextMenu.IsOpen = false;
+            _contextMenu.PlacementTarget = null;
+            _ = ShowWindow(_handle, SwHide);
+            return;
+        }
+
+        _ = ShowWindow(_handle, SwShow);
+    }
+
+    internal static void SetAllBossKeyHidden(bool hidden)
+    {
+        Volatile.Write(ref BossKeyHidden, hidden ? 1 : 0);
+        foreach (var window in OpenWindows.ToArray())
+            window.SetBossKeyHidden(hidden);
+    }
+
+    internal bool RefreshPreview()
+    {
+        var refreshed = !_disposed && _handle != 0 && _refreshPreview(_handle);
+        if (refreshed && EffectiveWindowOpacity < 1.0) _ = ApplyWindowOpacity(EffectiveWindowOpacity, force: true);
+        Log("independent_window_refresh",
+            ("mode", WindowMode), ("success", refreshed));
+        return refreshed;
+    }
+
+    internal void SetProtectedContent(bool protectedContent, string audioDisplay)
+    {
+        if (_disposed || _handle == 0 || _managedContent is not null) return;
+        if (!protectedContent)
+        {
+            _protectedOverlay?.Close();
+            _protectedOverlay = null;
+            return;
+        }
+        if (_protectedOverlay is null)
+            _protectedOverlay = ProtectedContentOverlayWindow.ShowFor(_handle,
+                audioDisplay);
+        else
+            _protectedOverlay.UpdateAudioDisplay(audioDisplay);
+        _protectedOverlay.Opacity = _appliedOpacity;
+    }
+
+    internal void SetSourceDimensions(uint width, uint height)
+    {
+        // Status polling can trail the renderer by seconds during rotation.
+        if (!_hasRendererDimensions) UpdateSourceDimensions(width, height);
+    }
+
+    private void UpdateSourceDimensions(uint width, uint height)
+    {
+        var changed = _sourceWidth != width || _sourceHeight != height;
+        if (changed) _pointerInput?.Invoke(new PreviewPointerEventArgs(PreviewPointerKind.Reset, 0, 0, 0, 0));
+        _sourceWidth = width;
+        _sourceHeight = height;
+        if (changed && _managedContent is null)
+            _ = UpdateDeviceAppearance(DeviceProductType, _deviceAppearance);
+        ApplyRotatedDimensions();
+        if (changed)
+            Log("independent_window_dimensions",
+                ("mode", WindowMode), ("size", $"{width}x{height}"),
+                ("rotation", _rotation));
+    }
+
+    internal void ToggleFullScreen()
+    {
+        if (_disposed || _handle == 0) return;
+        if (_isFullScreen)
+        {
+            _isFullScreen = false;
+            if (!_isFixed && UsesWindowPointerControl) ResetTouchControlInput();
+            _ = RemovePropW(_handle, "iPhoneMirrorFullScreen");
+            _ = SetWindowLongPtrW(_handle, GwlStyle, _restoreStyle);
+            _ = SetWindowPos(_handle, 0, _restoreRectangle.Left, _restoreRectangle.Top,
+                Math.Max(1, _restoreRectangle.Right - _restoreRectangle.Left),
+                Math.Max(1, _restoreRectangle.Bottom - _restoreRectangle.Top),
+                SwpNoZOrder | SwpFrameChanged | SwpShowWindow);
+            _aspectController.Reflow();
+            _ = SetForegroundWindow(_handle);
+            Log("independent_window_fullscreen",
+                ("mode", WindowMode), ("enabled", false));
+            FullScreenChanged?.Invoke(false);
+            return;
+        }
+
+        if (!GetWindowRect(_handle, out _restoreRectangle)) return;
+        var monitor = MonitorFromWindow(_handle, MonitorDefaultToNearest);
+        var monitorInfo = new MonitorInfo { Size = (uint)Marshal.SizeOf<MonitorInfo>() };
+        if (monitor == 0 || !GetMonitorInfoW(monitor, ref monitorInfo)) return;
+
+        _restoreStyle = GetWindowLongPtrW(_handle, GwlStyle);
+        _isFullScreen = true;
+        _ = SetPropW(_handle, "iPhoneMirrorFullScreen", (nint)1);
+        var fullScreenStyle = _managedContent is null
+            ? (nint)(_restoreStyle.ToInt64() & ~WsThickFrame)
+            : (nint)(_restoreStyle.ToInt64() & ~(WsCaption | WsThickFrame));
+        _ = SetWindowLongPtrW(_handle, GwlStyle, fullScreenStyle);
+        _ = SetWindowPos(_handle, 0, monitorInfo.Monitor.Left, monitorInfo.Monitor.Top,
+            monitorInfo.Monitor.Right - monitorInfo.Monitor.Left,
+            monitorInfo.Monitor.Bottom - monitorInfo.Monitor.Top,
+            SwpNoZOrder | SwpFrameChanged | SwpShowWindow);
+        _ = SetForegroundWindow(_handle);
+        Log("independent_window_fullscreen",
+            ("mode", WindowMode), ("enabled", true));
+        FullScreenChanged?.Invoke(true);
+    }
+
+    private void ApplyApplicationIcons()
+    {
+        var executable = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(executable) ||
+            ExtractIconExW(executable, 0, out _largeIcon, out _smallIcon, 1) == 0)
+            return;
+        if (_largeIcon != 0) _ = SendMessageW(_handle, WmSetIcon, 1, _largeIcon);
+        if (_smallIcon != 0) _ = SendMessageW(_handle, WmSetIcon, 0, _smallIcon);
+    }
+
+    private nint WindowProcedure(nint hwnd, int message, nint wParam, nint lParam,
+        ref bool handled)
+    {
+        if (message == WmPreviewGeometryChanged && _managedContent is null)
+        {
+            // Read the newest geometry even if several notifications queued up.
+            var pending = GetPropW(hwnd, PendingPreviewGeometry);
+            if (!_disposed && pending != 0 && pending != GetPropW(hwnd, AppliedPreviewGeometry))
+            {
+                var packed = unchecked((uint)pending.ToInt64());
+                _hasRendererDimensions = true;
+                UpdateSourceDimensions(packed >> 16, packed & 0xFFFF);
+                _aspectController.ApplyPendingResize();
+                _ = SetPropW(hwnd, AppliedPreviewGeometry, pending);
+            }
+            handled = true;
+            return 0;
+        }
+        if (message == NativeTouchInput.WmTouch && _managedContent is null)
+        {
+            GetClientRect(hwnd, out var touchRect);
+            NativeTouchInput.Dispatch(hwnd, wParam, lParam, IsPointerInputActive && IsUsbControlEnabledForWindow,
+                Math.Max(1, touchRect.Right - touchRect.Left), Math.Max(1, touchRect.Bottom - touchRect.Top),
+                (_rotation & 1) == 0 ? _sourceWidth : _sourceHeight,
+                (_rotation & 1) == 0 ? _sourceHeight : _sourceWidth, _rotation,
+                ForwardPointerInput);
+            handled = true;
+            return 0;
+        }
+        if (IsPointerInputActive && IsUsbControlEnabledForWindow && _managedContent is null && NativeTouchInput.IsPromotedMouseMessage(message))
+        {
+            handled = true;
+            return 0;
+        }
+        if (message == 0x007C && wParam.ToInt32() == GwlExStyle &&
+            lParam != 0 && _managedContent is not null) // WM_STYLECHANGING
+        {
+            // HwndTarget normally strips WS_EX_LAYERED when not using per-pixel
+            // alpha. This host owns system-managed constant alpha, including the
+            // native caption. Preserve it across WPF resize/target updates.
+            var style = Marshal.ReadInt32(lParam, sizeof(int));
+            style = _appliedOpacity < 1.0 ? style | WsExLayered : style & ~WsExLayered;
+            Marshal.WriteInt32(lParam, sizeof(int), style);
+            handled = true;
+            return 0;
+        }
+        if (message == NativePreviewMouse.WmMouseLeave)
+        {
+            _windowMouse.OnLeave();
+            if (UsesBluetoothWindowMouse && IsReverseControlEnabledForWindow)
+                _pointerInput?.Invoke(new PreviewPointerEventArgs(PreviewPointerKind.Reset, 0, 0, 0, 0));
+        }
+        if (message == WmActivate)
+            ActivationChanged?.Invoke((wParam.ToInt64() & 0xFFFF) != 0);
+        if (WindowsAutoPlayGuard.ShouldCancel(message, _sessionHandle != 0))
+        {
+            handled = true;
+            Log("autoplay_cancelled", ("message", "WM_QUERYCANCELAUTOPLAY"));
+            return 1;
+        }
+        // A normal button-up releases capture after clearing the button mask.
+        // Keep queued shortcuts and held keyboard modifiers alive in that case.
+        if (message == WmCaptureChanged && _capturedMouseButtons == 0 && !UsesBluetoothWindowMouse)
+        {
+            handled = true;
+            return 0;
+        }
+        if (IsPointerInputEnabledForWindow &&
+            (message == WmKillFocus || message == WmCancelMode ||
+             (message == WmActivate && (wParam.ToInt64() & 0xFFFF) == 0) ||
+             message == WmCaptureChanged ||
+             (message == WmActivateApp && wParam == 0)))
+        {
+            if (_capturedMouseButtons != 0)
+            {
+                _capturedMouseButtons = 0;
+                if (GetCapture() == hwnd) _ = ReleaseCapture();
+            }
+            _pointerInput?.Invoke(new PreviewPointerEventArgs(
+                PreviewPointerKind.Reset, 0, 0, 0, 0));
+            _keyboardInput?.Invoke(new PreviewKeyboardEventArgs(
+                PreviewKeyboardKind.Reset, 0));
+            handled = true;
+            return 0;
+        }
+        switch (message)
+        {
+            case WmMouseMove when IsPointerInputActive:
+                if (UsesBluetoothWindowMouse) _windowMouse.TrackLeave(hwnd);
+                else lParam = DrainQueuedMouseMoves(hwnd, lParam);
+                DispatchPointer(PreviewPointerKind.Move, lParam, 0, 0,
+                    NativePreviewMouse.PressedButtons(wParam));
+                handled = true;
+                return 0;
+            case WmLeftButtonDown when IsPointerInputActive:
+                BeginPointerButton(hwnd, 1);
+                DispatchPointer(PreviewPointerKind.ButtonDown, lParam, 1, 0);
+                handled = true;
+                return 0;
+            case WmLeftButtonUp when IsPointerInputActive:
+                _capturedMouseButtons = (byte)(_capturedMouseButtons & ~1);
+                DispatchPointer(PreviewPointerKind.ButtonUp, lParam, 1, 0);
+                if (!UsesBluetoothWindowMouse && _capturedMouseButtons == 0) _ = ReleaseCapture();
+                handled = true;
+                return 0;
+            case WmRightButtonDown when IsRightButtonForwardingEnabled:
+            case 0x0206 when IsRightButtonForwardingEnabled:
+                if (IsPointerInputActive)
+                {
+                    BeginPointerButton(hwnd, 2);
+                    DispatchPointer(PreviewPointerKind.ButtonDown, lParam, 2, 0);
+                }
+                handled = true;
+                return 0;
+            case WmRightButtonUp when IsRightButtonForwardingEnabled || (_capturedMouseButtons & 2) != 0:
+                if (IsPointerInputActive)
+                    DispatchPointer(PreviewPointerKind.ButtonUp, lParam, 2, 0);
+                if ((_capturedMouseButtons & 2) != 0)
+                {
+                    _capturedMouseButtons = (byte)(_capturedMouseButtons & ~2);
+                    if (_capturedMouseButtons == 0) _ = ReleaseCapture();
+                }
+                handled = true;
+                return 0;
+            case WmMiddleButtonDown when IsPointerInputActive:
+            case 0x0209 when UsesBluetoothWindowMouse && IsPointerInputActive:
+                BeginPointerButton(hwnd, 4);
+                DispatchPointer(PreviewPointerKind.ButtonDown, lParam, 4, 0);
+                handled = true;
+                return 0;
+            case WmMiddleButtonUp when IsPointerInputActive:
+                _capturedMouseButtons = (byte)(_capturedMouseButtons & ~4);
+                DispatchPointer(PreviewPointerKind.ButtonUp, lParam, 4, 0);
+                if (!UsesBluetoothWindowMouse && _capturedMouseButtons == 0) _ = ReleaseCapture();
+                handled = true;
+                return 0;
+            case WmXButtonDown when IsPointerInputActive:
+            case WmXButtonUp when IsPointerInputActive:
+                var sideButton = ((wParam.ToInt64() >> 16) & 0xffff) == 1 ? (byte)8 : (byte)16;
+                if (message == WmXButtonDown)
+                {
+                    BeginPointerButton(hwnd, sideButton);
+                    DispatchPointer(PreviewPointerKind.ButtonDown, lParam, sideButton, 0);
+                }
+                else
+                {
+                    _capturedMouseButtons = (byte)(_capturedMouseButtons & ~sideButton);
+                    DispatchPointer(PreviewPointerKind.ButtonUp, lParam, sideButton, 0);
+                    if (!UsesBluetoothWindowMouse && _capturedMouseButtons == 0) _ = ReleaseCapture();
+                }
+                handled = true;
+                return 1;
+            case WmMouseWheel when IsPointerInputActive:
+                if (!NativePreviewMouse.TryGetWheelClientPosition(hwnd, lParam, out lParam))
+                    break;
+                if (UsesBluetoothWindowMouse) _windowMouse.TrackLeave(hwnd);
+                DispatchPointer(PreviewPointerKind.Wheel, lParam, 0,
+                    unchecked((short)(wParam.ToInt64() >> 16)),
+                    NativePreviewMouse.PressedButtons(wParam));
+                handled = true;
+                return 0;
+            case WmSetCursor when IsReverseControlActive && UsesBluetoothWindowMouse:
+                NativeCursor.SetArrow();
+                handled = true;
+                return 1;
+            case WmSetCursor when IsPointerInputEnabledForWindow && IsUsbControlEnabledForWindow:
+                // USB touch control never captures the Windows pointer. A
+                // previous reverse-control route may have left the process
+                // cursor hidden or retained a resize/hand shape. Reassert
+                // both the arrow shape and visibility for this HWND.
+                NativeCursor.SetArrow();
+                ShowSystemCursor();
+                handled = true;
+                return 1;
+            case WmSetCursor when IsReverseControlActive:
+                HideSystemCursor();
+                handled = true;
+                return 1;
+            case WmKeyDown when IsPointerInputActive:
+                _keyboardInput?.Invoke(new PreviewKeyboardEventArgs(
+                    PreviewKeyboardKind.Down, wParam.ToInt32(),
+                    (int)((lParam.ToInt64() >> 16) & 0x1FF))
+                {
+                    MessageTime = PreviewKeyboardEventArgs.ReadMessageTime(),
+                    IsRepeat = (lParam.ToInt64() & (1L << 30)) != 0,
+                });
+                handled = true;
+                return 0;
+            case 0x0102 when IsPointerInputActive && ((lParam.ToInt64() >> 16) & 0xFF) == 0:
+                _keyboardInput?.Invoke(new PreviewKeyboardEventArgs(
+                    PreviewKeyboardKind.Text, 0) { Text = ((char)wParam).ToString() });
+                handled = true;
+                return 0;
+            case WmSysKeyDown when IsPointerInputActive:
+                _keyboardInput?.Invoke(new PreviewKeyboardEventArgs(
+                    PreviewKeyboardKind.Down, wParam.ToInt32(),
+                    (int)((lParam.ToInt64() >> 16) & 0x1FF))
+                {
+                    MessageTime = PreviewKeyboardEventArgs.ReadMessageTime(),
+                    IsRepeat = (lParam.ToInt64() & (1L << 30)) != 0,
+                });
+                handled = true;
+                return 0;
+            case WmKeyUp when IsPointerInputActive:
+            case WmSysKeyUp when IsPointerInputActive:
+                _keyboardInput?.Invoke(new PreviewKeyboardEventArgs(
+                    PreviewKeyboardKind.Up, wParam.ToInt32(),
+                    (int)((lParam.ToInt64() >> 16) & 0x1FF)) { MessageTime = PreviewKeyboardEventArgs.ReadMessageTime() });
+                handled = true;
+                return 0;
+            case WmContextMenu when IsRightButtonForwardingEnabled:
+            case WmNcRightButtonDown when IsRightButtonForwardingEnabled:
+            case WmNcRightButtonUp when IsRightButtonForwardingEnabled:
+                handled = true;
+                return 0;
+            case WmNcCalcSize when _managedContent is null:
+                handled = true;
+                return 0;
+            case WmNcHitTest when _managedContent is null:
+                handled = true;
+                // Input capture is temporary; do not turn it into the user's
+                // persistent "fixed window" preference when control starts.
+                return _isFullScreen || _isFixed || IsPointerInputEnabledForWindow
+                    ? HtClient : HitTestWindow(lParam);
+            case WmContextMenu:
+            case WmRightButtonUp:
+                handled = true;
+                ShowContextMenu();
+                return 0;
+            case WmNcRightButtonDown when _managedContent is null:
+            case WmNcRightButtonUp when _managedContent is null:
+            case WmRightButtonDown when _managedContent is null:
+                handled = true;
+                ShowContextMenu();
+                return 0;
+            case WmNcLeftButtonDoubleClick when _managedContent is null &&
+                wParam.ToInt32() == HtCaption:
+                handled = true;
+                _source.Dispatcher.BeginInvoke(DispatcherPriority.Input, ToggleFullScreen);
+                return 0;
+            case WmLeftButtonDoubleClick:
+                handled = true;
+                _source.Dispatcher.BeginInvoke(DispatcherPriority.Input, ToggleFullScreen);
+                return 0;
+            case WmEraseBackground:
+                // The native DirectComposition visual paints the complete
+                // client. Suppressing class-background erase avoids a white
+                // flash while its swap chain is being resized/recreated.
+                handled = true;
+                return 1;
+            case WmClose:
+                handled = true;
+                QueueClose();
+                return 0;
+            case WmSysKeyDown when wParam.ToInt32() == VkReturn && GetKeyState(VkMenu) < 0:
+                handled = true;
+                ToggleFullScreen();
+                return 0;
+            case WmDpiChanged:
+                _source.Dispatcher.BeginInvoke(DispatcherPriority.Loaded,
+                    _aspectController.Reflow);
+                break;
+        }
+        return 0;
+    }
+
+    private nint HitTestWindow(nint packedScreenPoint)
+    {
+        if (_handle == 0 || !GetWindowRect(_handle, out var bounds)) return HtClient;
+        var packed = packedScreenPoint.ToInt64();
+        var x = (short)(packed & 0xFFFF);
+        var y = (short)((packed >> 16) & 0xFFFF);
+        var dpi = GetDpiForWindow(_handle);
+        var border = Math.Max(6, (int)Math.Round(8.0 * (dpi == 0 ? 1.0 : dpi / 96.0)));
+
+        var left = x < bounds.Left + border;
+        var right = x >= bounds.Right - border;
+        var top = y < bounds.Top + border;
+        var bottom = y >= bounds.Bottom - border;
+        if (top && left) return HtTopLeft;
+        if (top && right) return HtTopRight;
+        if (bottom && left) return HtBottomLeft;
+        if (bottom && right) return HtBottomRight;
+        if (left) return HtLeft;
+        if (right) return HtRight;
+        if (top) return HtTop;
+        if (bottom) return HtBottom;
+        return HtCaption;
+    }
+
+    private void QueueClose()
+    {
+        if (_disposed || _closeQueued) return;
+        _closeQueued = true;
+        Log("independent_window_close_queued", ("mode", WindowMode));
+        try
+        {
+            _source.Dispatcher.BeginInvoke(DispatcherPriority.Send, Dispose);
+        }
+        catch (InvalidOperationException)
+        {
+            // The dispatcher can enter shutdown between WM_CLOSE and the
+            // queued callback. Dispose synchronously while the HWND is still
+            // on this thread instead of surfacing an unhandled hook error.
+            try { Dispose(); }
+            catch (Exception error)
+            {
+                Log("independent_window_close_failed", ("error", AppLog.Error(error)));
+            }
+        }
+    }
+
+    private void ShowContextMenu()
+    {
+        if (_disposed) return;
+        UpdateContextMenuLabels();
+        _contextMenu.IsOpen = true;
+        Log("independent_window_context_menu",
+            ("mode", WindowMode), ("full_screen", _isFullScreen),
+            ("top_most", _isTopMost), ("fixed", _isFixed));
+    }
+
+    private void UpdateContextMenuLabels()
+    {
+        _fullScreenItem.Header = LocalizationService.Get(
+            _isFullScreen ? "IndependentWindowExitFullScreen" :
+                "IndependentWindowEnterFullScreen");
+        _windowMenuItem.Header = LocalizationService.Get("IndependentWindowWindowMenu");
+        _styleItem.Header = LocalizationService.Get("IndependentWindowStyle");
+        _displayMenuItem.Header = LocalizationService.Get("IndependentWindowDisplayMenu");
+        _topMostItem.Header = LocalizationService.Get(
+            _isTopMost ? "IndependentWindowUnpin" : "IndependentWindowPin");
+        _fixedItem.Header = LocalizationService.Get(
+            _isFixed ? "IndependentWindowUnfix" : "IndependentWindowFix");
+        _fixedItem.IsEnabled = !_isFullScreen;
+        if (_reverseControlMenuItem is not null)
+        {
+            _reverseControlMenuItem.Header = LocalizationService.Get(
+                "IndependentWindowReverseControl");
+            _reverseControlMenuItem.IsEnabled = !_isFullScreen;
+        }
+        if (_bluetoothControlItem is not null)
+        {
+            _bluetoothControlItem.Header = LocalizationService.Get(
+                "IndependentWindowBluetoothControl");
+            _bluetoothControlItem.IsEnabled = !_isFullScreen;
+        }
+        if (_usbControlItem is not null)
+        {
+            _usbControlItem.Header = LocalizationService.Get(
+                "IndependentWindowWiredProjection");
+            _usbControlItem.IsEnabled = !_isFullScreen;
+        }
+        if (_wirelessControlItem is not null)
+        {
+            _wirelessControlItem.Header = LocalizationService.Get(
+                "IndependentWindowWirelessProjection");
+            _wirelessControlItem.IsEnabled = !_isFullScreen;
+        }
+        if (_cornerItem is not null)
+        {
+            _cornerItem.Header = LocalizationService.Get(
+                _cornersEnabled ? "IndependentWindowRemoveCorners" :
+                    "IndependentWindowKeepCorners");
+            _cornerItem.IsEnabled = !_phoneFrameEnabled;
+        }
+        if (_imageSettingsItem is not null)
+            _imageSettingsItem.Header = LocalizationService.Get(
+                "IndependentWindowImageSettings");
+        if (_projectionSettingsItem is not null)
+            _projectionSettingsItem.Header = LocalizationService.Get(
+                "IndependentWindowProjectionSettings");
+        _rotateLeftItem.Header = LocalizationService.Get("IndependentWindowRotateLeft");
+        _rotateRightItem.Header = LocalizationService.Get("IndependentWindowRotateRight");
+        _muteMenuItem.Header = LocalizationService.Get("IndependentWindowAudioMenu");
+        _muteThisItem.Header = LocalizationService.Get(
+            _isAudioEnabled?.Invoke() == false
+                ? "IndependentWindowUnmuteThis"
+                : "IndependentWindowMuteThis");
+        _muteOthersItem.Header = LocalizationService.Get("IndependentWindowMuteOthers");
+        _muteOthersItem.Visibility = IndependentWindowAudioPolicy.ShowMuteOthers(
+            _connectedDeviceCount?.Invoke() ?? 1)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        _closeItem.Header = LocalizationService.Get("IndependentWindowClose");
+    }
+
+    internal void ToggleWindowAudio()
+    {
+        if (_disposed || _isAudioEnabled is null || _setAudioEnabled is null) return;
+        var enabled = !_isAudioEnabled();
+        _setAudioEnabled(enabled);
+        UpdateContextMenuLabels();
+        Log("independent_window_audio",
+            ("mode", WindowMode), ("enabled", enabled));
+    }
+
+    private void MuteOtherWindows()
+    {
+        if (_disposed || _muteOtherWindows is null) return;
+        _muteOtherWindows();
+        UpdateContextMenuLabels();
+        Log("independent_window_mute_others", ("mode", WindowMode));
+    }
+
+    private void ShowImageSettings()
+    {
+        if (_disposed || _showImageSettings is null) return;
+        _showImageSettings(_handle);
+        Log("independent_window_image_settings", ("mode", WindowMode));
+    }
+
+    private void ShowStyleSettings()
+    {
+        if (_disposed || _handle == 0) return;
+        if (_styleWindow is not null)
+        {
+            if (_styleWindow.WindowState == WindowState.Minimized)
+                _styleWindow.WindowState = WindowState.Normal;
+            _styleWindow.Activate();
+            return;
+        }
+        var window = new WindowStyleSettingsWindow(_windowOpacity, SetWindowOpacity,
+            _opaqueOnHover, SetOpaqueOnHover, PhoneFramePreference?.Invoke() ?? _phoneFramePreferred,
+            _managedContent is null && _sessionHandle != 0 ? enabled => PhoneFramePreferenceRequested?.Invoke(enabled) ?? SetPhoneFrame(enabled) : null,
+            PhoneFrameDescription, PhoneFramePreferenceRequested is not null || CanShowPhoneFrame);
+        _ = new WindowInteropHelper(window) { Owner = _handle };
+        _styleWindow = window;
+        window.Closed += (_, _) => _styleWindow = null;
+        window.Show();
+    }
+
+    internal Func<bool, bool>? PhoneFramePreferenceRequested { get; set; }
+    internal Func<bool>? PhoneFramePreference { get; set; }
+    internal void RefreshPhoneFramePreference() => _styleWindow?.SetPhoneFrameEnabled(PhoneFramePreference?.Invoke() ?? _phoneFramePreferred);
+    internal bool CanShowPhoneFrame => _managedContent is null && _sessionHandle != 0 && DeviceFrame is not null;
+    internal bool PhoneFrameEnabled => _phoneFrameEnabled;
+    internal bool PhoneFramePreferred => _phoneFramePreferred;
+    internal event Action? PhoneFrameChanged;
+
+    private bool EffectivePhoneFrame => TemporaryBoolean(PreviewShortcutSetting.PhoneFrame, _phoneFramePreferred);
+
+    internal bool SetPhoneFrame(bool enabled)
+    {
+        if (enabled && !CanShowPhoneFrame) return false;
+        var previous = _phoneFramePreferred;
+        _phoneFramePreferred = enabled;
+        if (!ApplyPhoneFrame(EffectivePhoneFrame && CanShowPhoneFrame, notify: true))
+        {
+            _phoneFramePreferred = previous;
+            return false;
+        }
+        RefreshPhoneFramePreference();
+        return true;
+    }
+
+    private bool ApplyPhoneFrame(bool enabled, bool notify)
+    {
+        if (_disposed || _handle == 0 || _sessionHandle == 0 || _managedContent is not null) return false;
+        if (_phoneFrameEnabled == enabled) return true;
+        DeviceFrameHitTest? hitTest = null;
+        if (enabled)
+        {
+            if (DeviceFrame is not { } frame) return false;
+            hitTest = new DeviceFrameHitTest(frame);
+            if (!NativeCore.SetDeviceWindowFrameArtwork(_sessionHandle, _handle, frame)) return false;
+        }
+        if (!NativeCore.SetDeviceWindowPhoneFrame(_sessionHandle, _handle, enabled)) return false;
+        ResetTouchControlInput();
+        _phoneFrameEnabled = enabled;
+        _phoneFrameHitTest = hitTest;
+        if (notify) PhoneFrameChanged?.Invoke();
+        ApplyRotatedDimensions();
+        return true;
+    }
+
+    private void ForwardPointerInput(PreviewPointerEventArgs input)
+    {
+        if (_phoneFrameEnabled && DeviceFrame is { } frame && !_isFullScreen && !IsZoomed(_handle) && input.Kind != PreviewPointerKind.Reset)
+        {
+            var frameRotation = DeviceFrameRotation;
+            if (input.Kind is PreviewPointerKind.ButtonDown or PreviewPointerKind.TouchDown or PreviewPointerKind.Wheel &&
+                _phoneFrameHitTest?.Contains(frameRotation, input) != true) return;
+            input = PhoneFrameGeometry.MapPointer(frame, frameRotation, input);
+        }
+        _pointerInput?.Invoke(input);
+    }
+
+    private bool SetWindowOpacity(double opacity)
+    {
+        if (_disposed || _handle == 0 || !double.IsFinite(opacity)) return false;
+        opacity = Math.Clamp(opacity, 0.1, 1.0);
+        var previous = _windowOpacity;
+        _windowOpacity = opacity;
+        if (!ApplyWindowOpacity(EffectiveWindowOpacity)) { _windowOpacity = previous; return false; }
+        return true;
+    }
+
+    private double? TemporaryValue(PreviewShortcutSetting setting) =>
+        _temporarySettings.Values.Where(value => value.Setting == setting)
+            .OrderBy(value => value.Order).Select(value => (double?)value.Value).LastOrDefault();
+
+    private bool TemporaryBoolean(PreviewShortcutSetting setting, bool preference) =>
+        TemporaryValue(setting) is { } value ? value != 0 : preference;
+
+    private bool EffectiveOpaqueOnHover => TemporaryBoolean(PreviewShortcutSetting.OpaqueOnHover, _opaqueOnHover);
+
+    private double EffectiveWindowOpacity => TemporaryValue(PreviewShortcutSetting.Opacity) is { } percent
+        ? percent / 100 : EffectiveOpaqueOnHover && _isPointerOverWindow ? 1.0 : _windowOpacity;
+
+    internal Action? BeginTemporarySetting(SettingShortcutBinding binding)
+    {
+        if (_disposed || _handle == 0 || !binding.IsValid ||
+            (binding.Setting == PreviewShortcutSetting.PhoneFrame && !CanShowPhoneFrame)) return null;
+        var token = Guid.NewGuid();
+        _temporarySettings[token] = (binding.Setting, binding.Value, ++_temporarySettingOrder);
+        bool Apply() => binding.Setting switch
+        {
+            PreviewShortcutSetting.Opacity => ApplyWindowOpacity(EffectiveWindowOpacity),
+            PreviewShortcutSetting.Topmost => ApplyTopmost(),
+            PreviewShortcutSetting.OpaqueOnHover => ApplyHoverOpacity(),
+            PreviewShortcutSetting.PhoneFrame => ApplyPhoneFrame(EffectivePhoneFrame && CanShowPhoneFrame, notify: false),
+            _ => false,
+        };
+        if (!Apply()) { _temporarySettings.Remove(token); return null; }
+        return () =>
+        {
+            if (!_temporarySettings.Remove(token) || _disposed) return;
+            _ = Apply();
+        };
+    }
+
+    private bool SetOpaqueOnHover(bool enabled)
+    {
+        if (_disposed) return false;
+        var wasEnabled = _opaqueOnHover;
+        _opaqueOnHover = enabled;
+        if (ApplyHoverOpacity()) return true;
+        _opaqueOnHover = wasEnabled;
+        return false;
+    }
+
+    private bool ApplyHoverOpacity()
+    {
+        var enabled = EffectiveOpaqueOnHover;
+        var wasHovered = _isPointerOverWindow;
+        _isPointerOverWindow = enabled && IsPointerOverPreview();
+        if (!ApplyWindowOpacity(EffectiveWindowOpacity))
+        {
+            _isPointerOverWindow = wasHovered;
+            return false;
+        }
+        if (enabled) _hoverOpacityTimer.Start();
+        else _hoverOpacityTimer.Stop();
+        return true;
+    }
+
+    private bool IsPointerOverPreview()
+    {
+        if (_disposed || _handle == 0 || !IsWindowVisible(_handle) || IsIconic(_handle) ||
+            !GetCursorPos(out var point)) return false;
+        var hovered = WindowFromPoint(point);
+        return hovered == _handle || GetAncestor(hovered, 2) == _handle;
+    }
+
+    private void UpdateHoverState(bool hovered)
+    {
+        if (_disposed || !EffectiveOpaqueOnHover) return;
+        _isPointerOverWindow = hovered;
+        _ = ApplyWindowOpacity(EffectiveWindowOpacity);
+    }
+
+    private bool ApplyWindowOpacity(double opacity, bool force = false)
+    {
+        if (_disposed || _handle == 0) return false;
+        if (!force && _appliedOpacity == opacity) return true;
+        if (_managedContent is null)
+        {
+            // WS_EX_LAYERED cannot fade a no-redirection swap chain. Apply
+            // opacity to its native composition visual, leaving capture alone.
+            if (!NativeCore.SetDeviceWindowOpacity(_sessionHandle, _handle, opacity)) return false;
+        }
+        else
+        {
+            var previousOpacity = _appliedOpacity;
+            _appliedOpacity = opacity;
+            var style = GetWindowLongPtrW(_handle, GwlExStyle);
+            _ = SetWindowLongPtrW(_handle, GwlExStyle, opacity < 1.0
+                ? (nint)(style.ToInt64() | WsExLayered)
+                : (nint)(style.ToInt64() & ~WsExLayered));
+            if (opacity < 1.0 && !SetLayeredWindowAttributes(_handle, 0, (byte)Math.Round(opacity * 255), LwaAlpha))
+            {
+                _appliedOpacity = previousOpacity;
+                _ = SetWindowLongPtrW(_handle, GwlExStyle, style);
+                return false;
+            }
+        }
+        _appliedOpacity = opacity;
+        if (_protectedOverlay is not null) _protectedOverlay.Opacity = opacity;
+        return true;
+    }
+
+    private void ShowProjectionSettings()
+    {
+        if (_disposed || _showProjectionSettings is null) return;
+        _showProjectionSettings();
+        Log("independent_window_projection_settings", ("mode", WindowMode));
+    }
+
+    private void ToggleTopMost()
+    {
+        if (_disposed || _handle == 0) return;
+        _isTopMost = !_isTopMost;
+        _ = ApplyTopmost();
+        UpdateContextMenuLabels();
+        Log("independent_window_topmost",
+            ("mode", WindowMode), ("enabled", _isTopMost));
+    }
+
+    private bool ApplyTopmost() => SetWindowPos(_handle,
+        TemporaryBoolean(PreviewShortcutSetting.Topmost, _isTopMost) ? HwndTopMost : HwndNoTopMost,
+        0, 0, 0, 0, SwpNoSize | SwpNoMove | SwpNoActivate);
+
+    private void ToggleFixedWindow()
+    {
+        if (_disposed || _handle == 0 || _isFullScreen) return;
+        _isFixed = !_isFixed;
+        if (!_isFixed && UsesWindowPointerControl)
+            ResetTouchControlInput();
+        var style = GetWindowLongPtrW(_handle, GwlStyle).ToInt64();
+        style = _isFixed ? style & ~WsThickFrame : style | WsThickFrame;
+        _ = SetWindowLongPtrW(_handle, GwlStyle, (nint)style);
+        _ = SetWindowPos(_handle, 0, 0, 0, 0, 0,
+            SwpNoSize | SwpNoMove | SwpNoZOrder | SwpNoActivate | SwpFrameChanged);
+        if (!_isFixed) _aspectController.Reflow();
+        UpdateContextMenuLabels();
+        Log("independent_window_fixed",
+            ("mode", WindowMode), ("enabled", _isFixed));
+    }
+
+    private void ResetTouchControlInput()
+    {
+        ReleasePointerCapture();
+        _pointerInput?.Invoke(new PreviewPointerEventArgs(
+            PreviewPointerKind.Reset, 0, 0, 0, 0));
+        _keyboardInput?.Invoke(new PreviewKeyboardEventArgs(
+            PreviewKeyboardKind.Reset, 0));
+        NativeCursor.SetArrow();
+        ShowSystemCursor();
+    }
+
+    private readonly Func<nint> _inputForegroundWindow = GetForegroundWindow;
+    private bool IsReverseControlActive => AllowsControlInput && _pointerInput is not null &&
+        (_isReverseControlEnabled?.Invoke(_handle) ?? false) &&
+        _inputForegroundWindow() == _handle;
+    private bool IsReverseControlEnabledForWindow => _pointerInput is not null &&
+        (_isReverseControlEnabled?.Invoke(_handle) ?? false);
+    private bool IsUsbControlEnabledForWindow => _pointerInput is not null &&
+        (_isUsbControlEnabled?.Invoke() ?? false);
+    // The reverse-control callback also includes wired/wireless touch targets.
+    // Absolute Bluetooth previews use the same window menu as wired/wireless
+    // touch control. Relative Bluetooth capture keeps device right-clicks.
+    private bool IsRightButtonForwardingEnabled =>
+        IsReverseControlEnabledForWindow && !IsUsbControlEnabledForWindow && !UsesBluetoothWindowMouse;
+    private bool IsPointerInputEnabledForWindow =>
+        AllowsControlInput && (IsReverseControlEnabledForWindow || IsUsbControlEnabledForWindow);
+    private bool IsPointerInputActive =>
+        AllowsControlInput && (IsReverseControlActive || (IsUsbControlEnabledForWindow &&
+            _inputForegroundWindow() == _handle));
+
+    private void EnableReverseControl()
+    {
+        if (_disposed || _isFullScreen) return;
+        _requestReverseControl?.Invoke(_handle);
+        UpdateContextMenuLabels();
+    }
+
+
+    private static bool IsKeyDown(int virtualKey) => GetKeyState(virtualKey) < 0;
+
+    private void HideSystemCursor()
+    {
+        // ShowCursor uses one process-wide display counter. Other native
+        // windows or overlays can increment it after control is enabled, so
+        // assert hidden state whenever this independent HWND owns the cursor.
+        var cursor = new CursorInfo
+        {
+            Size = (uint)Marshal.SizeOf<CursorInfo>(),
+        };
+        if (!GetCursorInfo(ref cursor))
+        {
+            Log("independent_cursor_query_failed",
+                ("win32_error", Marshal.GetLastWin32Error()));
+            // The caller still consumes WM_SETCURSOR. Do not change
+            // ShowCursor's display count when it cannot be queried: repeated
+            // cursor messages would otherwise leave it hidden after reverse
+            // control has been turned off.
+            return;
+        }
+        if ((cursor.Flags & CursorShowing) != 0)
+            while (ShowCursor(false) >= 0) { }
+    }
+
+    private void ShowSystemCursor()
+    {
+        var cursor = new CursorInfo
+        {
+            Size = (uint)Marshal.SizeOf<CursorInfo>(),
+        };
+        if (!GetCursorInfo(ref cursor))
+        {
+            Log("independent_cursor_query_failed",
+                ("win32_error", Marshal.GetLastWin32Error()));
+            return;
+        }
+        if ((cursor.Flags & CursorShowing) == 0)
+            while (ShowCursor(true) < 0) { }
+    }
+
+    internal void PrepareForUsbControl()
+    {
+        if (_disposed || _handle == 0) return;
+        if (!_isFixed) ToggleFixedWindow();
+        if (!_isTopMost) ToggleTopMost();
+        _ = SetForegroundWindow(_handle);
+        UpdateContextMenuLabels();
+    }
+
+    internal void PrepareForBluetoothControl()
+    {
+        if (_disposed || _handle == 0 || !UsesBluetoothWindowMouse) return;
+        if (!_isFixed && !_isFullScreen) ToggleFixedWindow();
+    }
+
+    internal void ReleasePointerCapture()
+    {
+        _capturedMouseButtons = 0;
+        if (_handle != 0 && GetCapture() == _handle) _ = ReleaseCapture();
+    }
+
+    private void BeginPointerButton(nint hwnd, byte button)
+    {
+        if (UsesBluetoothWindowMouse) _windowMouse.TrackLeave(hwnd);
+        else
+        {
+            _capturedMouseButtons |= button;
+            _ = SetCapture(hwnd);
+        }
+    }
+
+    private void DispatchPointer(PreviewPointerKind kind, nint lParam,
+        byte button, int wheel, byte? windowsButtons = null)
+    {
+        if (_pointerInput is null || !GetClientRect(_handle, out var rect)) return;
+        var packed = lParam.ToInt64();
+        var x = unchecked((short)(packed & 0xFFFF));
+        var y = unchecked((short)((packed >> 16) & 0xFFFF));
+        var sourceWidth = (_rotation & 1) == 0 ? _sourceWidth : _sourceHeight;
+        var sourceHeight = (_rotation & 1) == 0 ? _sourceHeight : _sourceWidth;
+        ForwardPointerInput(new PreviewPointerEventArgs(kind, x, y, button, wheel,
+            Math.Max(1, rect.Right - rect.Left), Math.Max(1, rect.Bottom - rect.Top),
+            sourceWidth, sourceHeight, _rotation)
+        {
+            WindowsButtons = windowsButtons,
+        });
+    }
+
+    private static nint DrainQueuedMouseMoves(nint hwnd, nint currentLParam)
+    {
+        var latest = currentLParam;
+        var queued = new NativeMessage();
+        var drained = 0;
+        while (drained++ < 64 && PeekMessageW(ref queued, hwnd, WmMouseMove, WmMouseMove, PmRemove))
+            latest = queued.LParam;
+        return latest;
+    }
+
+    private void ToggleCorners()
+    {
+        if (_managedContent is not null || _sessionHandle == 0 || _handle == 0) return;
+        _cornersEnabled = !_cornersEnabled;
+        _ = _setCornerProfile(_sessionHandle, _handle,
+            _cornersEnabled ? _cornerRadius : 0, _cornerExponent);
+        UpdateContextMenuLabels();
+        Log("independent_window_corners",
+            ("mode", WindowMode), ("enabled", _cornersEnabled));
+    }
+
+    internal void Rotate(int delta)
+    {
+        if (_handle == 0) return;
+        _pointerInput?.Invoke(new PreviewPointerEventArgs(PreviewPointerKind.Reset, 0, 0, 0, 0));
+        _rotation = ((_rotation + delta) % 4 + 4) % 4;
+        if (_managedContent is not null)
+            _managedContent.LayoutTransform = new RotateTransform(_rotation * 90);
+        else if (_sessionHandle != 0)
+            _ = NativeCore.SetDeviceWindowRotation(_sessionHandle, _handle, _rotation);
+        ApplyRotatedDimensions();
+        Log("independent_window_rotation",
+            ("mode", WindowMode), ("quarter_turns", _rotation));
+    }
+
+    private void ApplyRotatedDimensions()
+    {
+        if (_sourceWidth == 0 || _sourceHeight == 0) return;
+        if (_phoneFrameEnabled && DeviceFrame is { } frame)
+        {
+            _aspectController.SetSourceDimensions(
+                (uint)((DefaultFrameRotation & 1) == 0 ? frame.FrameWidth : frame.FrameHeight),
+                (uint)((DefaultFrameRotation & 1) == 0 ? frame.FrameHeight : frame.FrameWidth));
+            return;
+        }
+        if ((_rotation & 1) != 0)
+            _aspectController.SetSourceDimensions(_sourceHeight, _sourceWidth);
+        else
+            _aspectController.SetSourceDimensions(_sourceWidth, _sourceHeight);
+    }
+
+    private void OnThemeChanged(object? sender, EventArgs e)
+    {
+        if (_disposed || _managedContent is null || _handle == 0) return;
+        var dark = ThemeService.IsDark ? 1 : 0;
+        _ = DwmSetWindowAttribute(_handle, DwmUseImmersiveDarkMode, ref dark, sizeof(int));
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        Log("independent_window_dispose_begin",
+            ("mode", WindowMode), ("attached", _attached),
+            ("full_screen", _isFullScreen));
+        _disposed = true;
+        _phoneFrameHitTest = null;
+        _hoverOpacityTimer.Stop();
+        OpenWindows.Remove(this);
+        ThemeService.ThemeChanged -= OnThemeChanged;
+        _styleWindow?.Close();
+        _styleWindow = null;
+        _protectedOverlay?.Close();
+        _protectedOverlay = null;
+        _contextMenu.IsOpen = false;
+        _contextMenu.PlacementTarget = null;
+        _ = ShowWindow(_handle, SwHide);
+        _aspectController.Dispose();
+        if (_attached && _handle != 0)
+        {
+            // Isolate native detach failures so subsequent HWND/GDI cleanup still runs.
+            try { _detachPreview(_handle); }
+            catch (Exception ex) { Log("detach_preview_failed", ("error", ex.Message)); }
+            _attached = false;
+        }
+        _ = RemovePropW(_handle, PendingPreviewGeometry);
+        _ = RemovePropW(_handle, AppliedPreviewGeometry);
+        if (_managedContentRoot is not null)
+        {
+            if (_managedContent is not null)
+                _managedContent.LayoutTransform =
+                    _managedContentOriginalLayoutTransform ?? Transform.Identity;
+            _managedContentRoot.Child = null;
+            _source.RootVisual = null;
+        }
+        _source.RemoveHook(WindowProcedure);
+        _source.Dispose();
+        _handle = 0;
+        if (_managedContentRoot is not null)
+        {
+            try { _managedContentDetached?.Invoke(); }
+            catch { /* Window teardown remains best-effort. */ }
+        }
+        if (_largeIcon != 0) _ = DestroyIcon(_largeIcon);
+        if (_smallIcon != 0 && _smallIcon != _largeIcon) _ = DestroyIcon(_smallIcon);
+        _largeIcon = 0;
+        _smallIcon = 0;
+        Log("independent_window_disposed", ("mode", WindowMode));
+        var closedHandlers = Closed;
+        Closed = null;
+        if (closedHandlers is null) return;
+        foreach (EventHandler handler in closedHandlers.GetInvocationList())
+        {
+            try { handler(this, EventArgs.Empty); }
+            catch (Exception error)
+            {
+                Log("independent_window_closed_handler_failed",
+                    ("mode", WindowMode), ("error", AppLog.Error(error)));
+            }
+        }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetLayeredWindowAttributes(nint hwnd, uint colorKey, byte alpha, uint flags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HoverPoint { public int X, Y; }
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorPos(out HoverPoint point);
+    [DllImport("user32.dll")]
+    private static extern nint WindowFromPoint(HoverPoint point);
+    [DllImport("user32.dll")]
+    private static extern nint GetAncestor(nint hwnd, uint flags);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(nint hwnd);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowRect
+    {
+        internal int Left;
+        internal int Top;
+        internal int Right;
+        internal int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CursorInfo
+    {
+        internal uint Size;
+        internal uint Flags;
+        internal nint Cursor;
+        internal int X;
+        internal int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo
+    {
+        internal uint Size;
+        internal WindowRect Monitor;
+        internal WindowRect WorkArea;
+        internal uint Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeMessage
+    {
+        internal nint Hwnd;
+        internal uint Message;
+        internal nint WParam;
+        internal nint LParam;
+        internal uint Time;
+        internal int PointX;
+        internal int PointY;
+        internal uint Private;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowTextW(nint window, string text);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint SendMessageW(nint window, int message, nint wParam, nint lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PeekMessageW(ref NativeMessage message, nint window,
+        uint minMessage, uint maxMessage, uint removeMessage);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetPropW(nint window, string name, nint data);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint GetPropW(nint window, string name);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint RemovePropW(nint window, string name);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint ExtractIconExW(string file, int iconIndex,
+        out nint largeIcon, out nint smallIcon, uint iconCount);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyIcon(nint icon);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(nint window, int command);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern int ShowCursor([MarshalAs(UnmanagedType.Bool)] bool show);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorInfo(ref CursorInfo cursorInfo);
+
+    [DllImport("user32.dll")]
+    private static extern nint GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern nint SetFocus(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern nint SetCapture(nint window);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern nint GetCapture();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsIconic(nint window);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsZoomed(nint window);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(nint window, out WindowRect rectangle);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetClientRect(nint window, out WindowRect rectangle);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int virtualKey);
+
+    [DllImport("user32.dll")]
+    private static extern nint GetWindowLongPtrW(nint window, int index);
+
+    [DllImport("user32.dll")]
+    private static extern nint SetWindowLongPtrW(nint window, int index, nint value);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(nint window, nint insertAfter, int x, int y,
+        int width, int height, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern nint MonitorFromWindow(nint window, uint flags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfoW(nint monitor, ref MonitorInfo monitorInfo);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(nint window, int attribute,
+        ref int value, int valueSize);
+
+    [DllImport("dwmapi.dll", EntryPoint = "DwmSetWindowAttribute")]
+    private static extern int DwmSetWindowAttributeColor(nint window, int attribute,
+        ref uint value, int valueSize);
+
+}

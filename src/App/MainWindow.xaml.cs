@@ -1,0 +1,8452 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using System.Collections.Specialized;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using IPhoneMirror.App.Localization;
+using IPhoneMirror.App.Interop;
+using IPhoneMirror.App.Models;
+using IPhoneMirror.App.Services;
+using IPhoneMirror.App.Updater;
+using IPhoneMirror.App.ViewModels;
+using IPhoneMirror.App.Windows;
+using Microsoft.Win32;
+using SymbolIcon = Wpf.Ui.Controls.SymbolIcon;
+using SymbolRegular = Wpf.Ui.Controls.SymbolRegular;
+
+namespace IPhoneMirror.App;
+
+// Build marker: GUI hosts the native D3D11 swapchain; decoded presentation
+// frames no longer pass through WPF WriteableBitmap or CompositionTarget.
+public partial class MainWindow : Wpf.Ui.Controls.FluentWindow
+{
+    private enum LeftWorkspacePanel
+    {
+        None,
+        Mirroring,
+        Devices,
+    }
+
+    public string VersionText => VersionManager.DisplayVersion;
+
+    private readonly MainViewModel _viewModel;
+    private readonly DispatcherTimer _refreshTimer;
+    private readonly DispatcherTimer _mediaCastTimer;
+    private readonly DispatcherTimer _mediaPlaybackTimer;
+    private readonly DispatcherTimer _mediaControlsHideTimer;
+    private readonly DispatcherTimer _mediaOpeningTimer;
+    private readonly MultiDevicePreviewManager _secondaryMirrors;
+    private DeveloperToolsWindow? _developerToolsWindow;
+    private DeviceBindingWindow? _reverseControlWindow;
+    private readonly HashSet<string> _deviceProfileGuidanceShown =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _screenshotGate = new(1, 1);
+    private readonly MediaCastEventGate _mediaCastEvents = new();
+    private bool _isFullScreen;
+    private bool _isWindowMaximized;
+    private bool _handlingNativeMaximize;
+    private bool _restoreWasWindowMaximized;
+    private Rect _windowMaximizeRestoreBounds;
+    private WindowStyle _restoreWindowStyle;
+    private WindowState _restoreWindowState;
+    private ResizeMode _restoreResizeMode;
+    private bool _restoreTopmost;
+    private Rect _restoreBounds;
+    private bool _shutdownStarted;
+    private bool _allowClose;
+    private DeviceViewModel? _pressedDevice;
+    private Point _devicePressPoint;
+    private DateTime _devicePressStartedUtc;
+    private bool _deviceDragStarted;
+    private int _previewTransitionRevision;
+
+
+    // Per-device USB touch pointer state. The main preview and every
+    // independent preview window route pointer events here with a target
+    // udid; a single shared pressed/pending-move state would let one
+    // device's drag sequence suppress or corrupt another device's input.
+    // Keys are normalized with OrdinalIgnoreCase to match the
+    // DeviceViewModel.UdidEquals comparison used for bridge targeting.
+    private sealed class UsbTouchPointerState
+    {
+        public bool Pressed;
+        public double LastX = 0.5;
+        public double LastY = 0.5;
+        public bool MoveDraining;
+        public bool PendingMoveQueued;
+        public double PendingMoveX;
+        public double PendingMoveY;
+        public Func<bool>? PendingMoveCanSend;
+        public double WheelRemainder;
+        public bool WheelActive;
+        public double WheelY;
+        public bool WheelNeedsDown;
+        public bool WheelDraining;
+        public bool WheelCancelled;
+        public double WheelVelocity;
+        public double WheelGestureDistance;
+        public int WheelLastDirection;
+    }
+
+    // Wheel touch gestures are confined to this vertical band. Starting a
+    // gesture at least 6% away from either screen edge guarantees two things:
+    // (1) even an edge-clipped gesture still travels far enough that iOS
+    // cannot classify it as a tap (which would open whatever sits under the
+    // cursor), and (2) the synthesized contact never enters the iOS edge
+    // gesture zones (home-indicator swipe, notification-center pull).
+    private const double WheelSafeMinY = 0.06;
+    private const double WheelSafeMaxY = 0.94;
+    private const double WheelMinGesture = 0.08;
+
+    private readonly Dictionary<string, UsbTouchPointerState> _usbTouchStates =
+        new(StringComparer.OrdinalIgnoreCase);
+    private ulong _mediaCommandId;
+    private double _mediaStartPosition;
+    private bool _mediaPlaying;
+    private bool _mediaShouldPlay;
+    private double _mediaPlaybackSpeed = 1.0;
+    private bool _mediaSpeedFallbackPending;
+    private bool _mediaSpeedFallbackPromptShown;
+    private DateTime _mediaSpeedChangedUtc;
+    private bool _mediaOpened;
+    private bool _mediaStopped = true;
+    private bool _mediaCastActive;
+    private bool _mediaIsLive;
+    private bool _mediaUsesHlsBridge;
+    // The HLS bridge exposes a fresh local stream after every restart. Keep
+    // its programme-time origin separate from MediaElement.Position, which is
+    // always relative to that local stream.
+    private double _mediaProgramDuration;
+    private double _mediaBridgeOffset;
+    // The visible/controller timeline is a programme clock, not the current
+    // MediaElement timestamp. HLS bridge replacement can reset or jump the
+    // latter; a wall-clock anchor keeps progress proportional and monotonic.
+    private double _mediaTimelineAnchorPosition;
+    private DateTime _mediaHealthSampleUtc;
+    private bool _mediaPrematureEndRetried;
+    private MediaCastPlaybackStatus _mediaTerminalStatus;
+    private int _mediaBridgeEndCheckRevision;
+    private double _mediaLastActualPosition;
+    private DateTime _mediaLastActualAdvanceUtc;
+    private DateTime _mediaPositionRegressionSinceUtc;
+    private double _mediaObservedPosition;
+    private DateTime _mediaTimelineAnchorUtc;
+    private bool _mediaTimelineRunning;
+    private double _lastRejectedMediaPosition;
+    private DateTime _mediaProgressSampleUtc;
+    private bool _mediaBuffering;
+    private bool _mediaWaitingForFirstFrame;
+    private bool _mediaSeekInteraction;
+    private bool _mediaSeekCommitPending;
+    private bool _mediaSeekTrackInteraction;
+    private double _mediaSeekInteractionTarget;
+    private bool _mediaSeekLoading;
+    private double _lastSeekSliderSyncPosition = double.NaN;
+    // Keep the last usable VOD timeline across the short interval where WMF
+    // exposes no NaturalDuration while an HLS element is being replaced.
+    private double _mediaLastTimelineDuration;
+    private double _mediaLastTimelinePosition;
+    // A HLS seek replaces the local MediaElement. Keep the programme-time
+    // target visible while that replacement is still opening.
+    private double? _mediaPendingHlsSeekPosition;
+    private DateTime _mediaPendingHlsSeekStartedUtc;
+    private double? _mediaPendingSeekPosition;
+    private DateTime _mediaPendingSeekStartedUtc;
+    private DateTime _mediaPendingSeekLastAttemptUtc;
+    private int _mediaPendingSeekAttemptCount;
+    private bool _updatingMediaCastControls;
+    private bool _mediaControlsVisible = true;
+    private double _mediaOpeningPosition;
+    private DateTime _mediaOpenedAtUtc;
+    private int _mediaRecoveryRevision;
+    // HLS VOD manifests can be exposed by WMF one segment at a time. A
+    // segment is often shorter than the normal 10-second stability window,
+    // so use a shorter window to reset transient-recovery attempts after the
+    // stream has made real progress instead of exhausting the budget during
+    // an otherwise healthy long programme.
+    private readonly MediaRecoveryBackoff _mediaRecoveryBackoff = new(
+        stablePlaybackWindow: TimeSpan.FromSeconds(3));
+    private CancellationTokenSource _mediaRecoveryCancellation = new();
+    private Uri? _mediaSource;
+    private Uri? _mediaPlaybackSource;
+    private HlsMediaPlaybackBridge? _mediaHlsBridge;
+    private readonly MediaCastAudioDecoder _mediaCastAudioDecoder = new();
+    private NativePreviewWindow? _mediaCastPreviewWindow;
+    private ProjectionSettingsWindow? _projectionSettingsWindow;
+    private ShortcutSettingsWindow? _shortcutSettingsWindow;
+    private ProtectedContentNoticeWindow? _protectedContentNoticeWindow;
+    private string? _protectedContentNoticeUdid;
+    private MediaOutputSettingsWindow? _mediaOutputSettingsWindow;
+    private string? _projectionSettingsUdid;
+    private ulong _projectionSettingsSessionHandle;
+    private string? _lastPlaybackReportError;
+    private LeftWorkspacePanel _leftWorkspacePanel = LeftWorkspacePanel.Devices;
+    private bool _isSettingsPanelVisible;
+    private bool _isSynchronizingWorkspacePanelControls;
+    private bool _workspaceControlsReady;
+    private bool _themeControlReady;
+    private bool _lightweightModeApplied;
+    private bool _lightweightPreviewWidthQueued;
+    private bool _lightweightInitialWorkspaceFitQueued;
+    private bool _lightweightWidthNeedsFit;
+    private bool _lightweightWindowAnimationActive;
+    private int _lightweightWindowWidthStartPixels;
+    private int _lightweightWindowWidthTargetPixels;
+    private int _lightweightWindowLastAppliedWidthPixels;
+    private int _lightweightWindowHeightPixels;
+    private double _lightweightWindowWidthTargetDips;
+    private int _lightweightWindowStartX;
+    private int _lightweightWindowTargetX;
+    private int _lightweightWindowLastAppliedX;
+    private int _lightweightWindowTopPixels;
+    private bool _lightweightCenterWidthLocked;
+    private bool _workspaceSurfaceAnimationActive;
+    private double _workspaceLeftSurfaceStartWidth;
+    private double _workspaceLeftSurfaceTargetWidth;
+    private double _workspaceRightSurfaceStartWidth;
+    private double _workspaceRightSurfaceTargetWidth;
+    private double _workspaceLeftGapStartWidth;
+    private double _workspaceLeftGapTargetWidth;
+    private double _workspaceRightGapStartWidth;
+    private double _workspaceRightGapTargetWidth;
+    private double _lightweightCenterTargetWidth;
+    private double _lightweightTargetMinWidth;
+    private double _completeModeWidth;
+    private long _mediaCastOutputTimestamp;
+    private HwndSource? _windowSource;
+    private int _lastControlSourceX;
+    private int _lastControlSourceY;
+    private uint _lastControlGeometryWidth;
+    private uint _lastControlGeometryHeight;
+    private int _lastControlGeometryRotation;
+    private bool _controlPointerInitialized;
+    private readonly Timer _controlPointerTimer;
+    private readonly Timer _cursorClipWatchdogTimer;
+    private int _cursorClipWatchdogRunning;
+    private long _lastCursorClipReassertLogTimestamp;
+    private readonly SemaphoreSlim _bluetoothRouteGate = new(1, 1);
+    private int _bluetoothRouteChanging;
+    private readonly object _controlQueueSync = new();
+    private int _pendingControlDx;
+    private int _pendingControlDy;
+    private int _pendingControlWheel;
+    private double _controlWheelRemainder;
+    private int _lastWheelResolutionMultiplier = 1;
+    private byte _pendingControlButtons;
+    private bool _pendingControlStateDirty;
+    private long _pendingControlMotionAt;
+    private int _controlPointerFlushInFlight;
+    private int _controlPointerTimerArmed;
+    private byte _controlButtons;
+    private double _controlRemainderX;
+    private readonly RawMouseDeltaTracker _rawMouseDeltaTracker = new();
+    private double _controlRemainderY;
+    private readonly HashSet<byte> _controlKeyboardUsages = [];
+    private readonly HashSet<int> _controlModifierKeys = [];
+    private byte _controlKeyboardModifiers;
+    private bool _pasteVPending;
+    private bool _windowsCursorHidden;
+    private nint _activeControlWindow;
+    private string? _activeControlUdid;
+    private bool _rawMouseInputEnabled;
+    private bool _bluetoothWindowMouseEnabled;
+    private bool _absoluteWindowMouseActive;
+    private bool _windowBluetoothPointerInside;
+    private (double X, double Y) _absoluteWindowMousePosition;
+    private long _windowBluetoothPointerGeneration;
+    private (int Width, int Height) _windowBluetoothPointerSurface;
+    private const int WindowMouseButtonQueueLimit = 8;
+    private readonly Queue<(int Dx, int Dy, byte Buttons, long MotionAt)> _windowMouseButtonReports = new();
+    private readonly object _cursorClipSync = new();
+    private bool _rawKeyboardInputEnabled;
+    private nint _rawInputBuffer;
+    private int _rawInputBufferSize;
+    private readonly Dictionary<BluetoothShortcutAction, KeyboardShortcut> _bluetoothShortcuts = [];
+    private readonly HashSet<int> _registeredHotKeyIds = [];
+    private bool _bossKeyHidden;
+    private int _bossKeyChanging;
+    private nint _keyboardHook;
+    private readonly LowLevelKeyboardProc _keyboardHookProc;
+
+    private const int WmInput = 0x00FF;
+    private const uint PmRemove = 0x0001;
+    private const int WmHotKey = 0x0312;
+    private const int WmSetCursor = 0x0020;
+    private const int WmActivateApp = 0x001C;
+    private const int WmSetFocus = 0x0007;
+    private const int WmKillFocus = 0x0008;
+    private const int WmCancelMode = 0x001F;
+    private const int WmCaptureChanged = 0x0215;
+    private const int BluetoothModeHotKeyId = 0x4991;
+    private const int WirelessModeHotKeyId = 0x4992;
+    private const int WiredModeHotKeyId = 0x4993;
+    private const int BluetoothControlCenterHotKeyId = 0x4982;
+    private const int BluetoothNotificationCenterHotKeyId = 0x4983;
+    private const int BluetoothAppSwitcherHotKeyId = 0x4984;
+    private const int BluetoothHomeHotKeyId = 0x4985;
+    private const int BluetoothBossKeyHotKeyId = 0x4987;
+    private const int BluetoothDockHotKeyId = 0x4988;
+    private const int BluetoothSiriHotKeyId = 0x4990;
+    private const int BluetoothVolumeUpHotKeyId = 0x4989;
+    private const int BluetoothVolumeDownHotKeyId = 0x498A;
+    private const int BluetoothLockScreenHotKeyId = 0x498B;
+    private const uint RidInput = 0x10000003;
+    private const uint RimTypeMouse = 0;
+    private const uint RimTypeKeyboard = 1;
+    private const uint RidevInputSink = 0x00000100;
+    private const uint RidevNoLegacy = 0x00000030;
+    private const uint RidevRemove = 0x00000001;
+    private const ushort RawMouseLeftDown = 0x0001;
+    private const ushort RawMouseLeftUp = 0x0002;
+    private const ushort RawMouseRightDown = 0x0004;
+    private const ushort RawMouseRightUp = 0x0008;
+    private const ushort RawMouseMiddleDown = 0x0010;
+    private const ushort RawMouseMiddleUp = 0x0020;
+    private const ushort RawMouseXButton1Down = 0x0040;
+    private const ushort RawMouseXButton1Up = 0x0080;
+    private const ushort RawMouseXButton2Down = 0x0100;
+    private const ushort RawMouseXButton2Up = 0x0200;
+    private const ushort RawMouseWheel = 0x0400;
+    private const uint CursorShowing = 0x00000001;
+    private const double LightweightDefaultPreviewAspect = 1206d / 2622d;
+    private const double LightweightMinimumPreviewWidth = 320;
+    private const double LightweightNormalPortraitPreviewWidth = 340;
+    private const double LightweightMinimumWindowWidth = 640;
+    private const double LightweightWorkAreaInset = 24;
+
+    private bool IsBluetoothControlActive => IsBluetoothControlActiveFor(
+        _activeControlWindow != 0 ? _activeControlUdid : _viewModel.SelectedDevice?.Udid);
+
+    private bool IsBluetoothMouseCaptured =>
+        !Volatile.Read(ref _bluetoothWindowMouseEnabled) && IsBluetoothControlActive;
+
+    private bool IsBluetoothControlActiveFor(string? udid)
+    {
+        if (_bossKeyHidden || !_viewModel.BluetoothControlIsInputEnabled ||
+            string.IsNullOrWhiteSpace(udid) ||
+            !_viewModel.IsBluetoothControlTarget(udid)) return false;
+        return _activeControlWindow != 0
+            ? DeviceViewModel.UdidEquals(_activeControlUdid, udid)
+            : DeviceViewModel.UdidEquals(_viewModel.SelectedDevice?.Udid, udid);
+    }
+
+    private bool IsUsbControlActive => _viewModel.UsbControlIsInputEnabled &&
+        _activeControlWindow == 0 &&
+        _viewModel.IsUsbControlTarget(_viewModel.SelectedDevice?.Udid);
+
+    private static readonly TimeSpan DeviceDragHoldDuration = TimeSpan.FromMilliseconds(350);
+    public MainWindow()
+    {
+        _keyboardHookProc = KeyboardHookProcedure;
+        InitializeComponent();
+        InitializeWorkspaceBindings();
+        // Slider handles direct track clicks at the class-handler level and can
+        // mark the mouse event handled before an ordinary XAML handler sees it.
+        // Observe handled events so every click/drag has one complete seek
+        // transaction and cannot be overwritten by the playback timer.
+        MediaCastSeekSlider.AddHandler(Mouse.PreviewMouseDownEvent,
+            new MouseButtonEventHandler(OnMediaCastSeekPointerDown),
+            handledEventsToo: true);
+        MediaCastSeekSlider.AddHandler(Mouse.PreviewMouseUpEvent,
+            new MouseButtonEventHandler(OnMediaCastSeekPointerUp),
+            handledEventsToo: true);
+        MediaCastSeekSlider.AddHandler(Mouse.PreviewMouseMoveEvent,
+            new MouseEventHandler(OnMediaCastSeekPointerMove),
+            handledEventsToo: true);
+        MediaCastSeekSlider.AddHandler(Mouse.LostMouseCaptureEvent,
+            new MouseEventHandler(OnMediaCastSeekLostCapture),
+            handledEventsToo: true);
+        MediaCastSeekSlider.AddHandler(Keyboard.KeyUpEvent,
+            new KeyEventHandler(OnMediaCastSeekKeyUp),
+            handledEventsToo: true);
+        if (Application.Current is App app)
+        {
+            ThemeComboBox.SelectedValue = app.UpdateSettings.Theme.ToString();
+            RestoreSettingsCategory(app.UpdateSettings.SettingsCategory);
+            foreach (var action in Enum.GetValues<BluetoothShortcutAction>())
+                _bluetoothShortcuts[action] = KeyboardShortcut.FromSettings(
+                    app.UpdateSettings, action);
+        }
+        InitializeProxySettings();
+        _themeControlReady = true;
+        _workspaceControlsReady = true;
+        _viewModel = new MainViewModel();
+        _bluetoothWindowMouseEnabled = _viewModel.BluetoothWindowMouseEnabled;
+        InitializeAutomation();
+        MainPreviewHost.PointerInput += OnControlPointerInput;
+        MainPreviewHost.KeyboardInput += OnControlKeyboardInput;
+        _viewModel.SetMediaCastOutputProviders(
+            CaptureMediaCastNv12Frame, CaptureMediaCastVideoFrame,
+            afterSequence => _mediaCastAudioDecoder.GetPacket(afterSequence));
+        _secondaryMirrors = new MultiDevicePreviewManager(_viewModel,
+            (udid, window) => !_bossKeyHidden &&
+                (_viewModel.IsUsbControlTarget(udid) ||
+                 (_activeControlWindow == window && IsBluetoothControlActiveFor(udid))));
+        _secondaryMirrors.ReverseControlRequested += OnIndependentReverseControlRequested;
+        _secondaryMirrors.UsbControlRequested += OnIndependentUsbControlRequested;
+        _secondaryMirrors.WirelessControlRequested += OnIndependentWirelessControlRequested;
+        _secondaryMirrors.PreviewClosed += OnIndependentPreviewClosed;
+        _secondaryMirrors.PointerInput += OnIndependentPointerInput;
+        _secondaryMirrors.KeyboardInput += OnIndependentKeyboardInput;
+        _secondaryMirrors.KeyboardFocusChanged += OnIndependentKeyboardFocusChanged;
+        DataContext = _viewModel;
+        _viewModel.PropertyChanged += OnViewModelPropertyChanged;
+        _secondaryMirrors.PhoneFrameChanged += RefreshProjectionPhoneFrame;
+        _viewModel.PropertyChanged += (_, _) => RefreshProjectionPhoneFrame();
+        Loaded += (_, _) => RefreshProjectionPhoneFrame();
+        _viewModel.Devices.CollectionChanged += OnDevicesCollectionChanged;
+        _viewModel.DeviceVideoSizeChanged += OnDeviceVideoSizeChanged;
+        _viewModel.DeviceSessionHandleChanged += OnDeviceSessionHandleChanged;
+        _viewModel.DeviceProtectionStateChanged += OnDeviceProtectionStateChanged;
+        _viewModel.MediaCastCommandReceived += OnMediaCastCommandReceived;
+        _viewModel.MediaCastStopRequested += OnMediaCastStopRequested;
+        _viewModel.MediaCastAudioSettingsChanged += OnMediaCastAudioSettingsChanged;
+        _viewModel.ProjectionSettingsRequested += OnProjectionSettingsRequested;
+        _viewModel.MediaOutputSettingsRequested += OnMediaOutputSettingsRequested;
+        _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        _refreshTimer.Tick += (_, _) => _ = _viewModel.RefreshAsync();
+        _mediaCastTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _mediaCastTimer.Tick += (_, _) => _viewModel.RefreshMediaCast();
+        _mediaPlaybackTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _mediaOpeningTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _mediaOpeningTimer.Tick += OnMediaOpeningTimerTick;
+        _mediaPlaybackTimer.Tick += OnMediaPlaybackTimerTick;
+        _mediaControlsHideTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(2.6),
+        };
+        _mediaControlsHideTimer.Tick += OnMediaControlsHideTimerTick;
+        _controlPointerTimer = new Timer(_ => _ = FlushControlPointerSafeAsync(),
+            null, Timeout.Infinite, Timeout.Infinite);
+        _cursorClipWatchdogTimer = new Timer(_ => EnforceBluetoothCursorConfinement(),
+            null, Timeout.Infinite, Timeout.Infinite);
+        StateChanged += OnWindowStateChanged;
+        Loaded += OnLoaded;
+        Loaded += (_, _) => { InitializePreviewToolbar(); UpdatePreviewStatusPresentation(); };
+        SourceInitialized += OnSourceInitialized;
+        Deactivated += OnMainKeyboardDeactivated;
+        Activated += OnMainKeyboardActivated;
+        PreviewGotKeyboardFocus += OnMainKeyboardFocusChanged;
+        PreviewTextInput += OnRemoteTextInput;
+        SizeChanged += OnWorkspaceWindowSizeChanged;
+        IsVisibleChanged += OnWorkspaceWindowVisibilityChanged;
+        Unloaded += OnWorkspaceUnloaded;
+        Closed += OnClosed;
+        Closed += (_, _) => _deviceActionLifetime.Cancel();
+        Closing += OnClosing;
+        InitializeKeyboardMapping();
+        _viewModel.AddDiagnosticLog(AppLog.Event("main_window_created",
+            ("thread", Environment.CurrentManagedThreadId),
+            ("dpi", PresentationSource.FromVisual(this)?.CompositionTarget?.TransformToDevice.M11 ?? 0)));
+    }
+
+    private void OnSourceInitialized(object? sender, EventArgs e)
+    {
+        // Tray startup creates the HWND before Show attaches the visual tree.
+        // FromVisual is null then, and SourceInitialized will not fire again
+        // when the workspace opens. Bind input to the already-created HWND.
+        _windowSource = HwndSource.FromHwnd(new WindowInteropHelper(this).Handle);
+        _windowSource?.AddHook(WindowMessageHook);
+        RegisterBluetoothControlHotkey();
+        _viewModel.AddDiagnosticLog(AppLog.Event("main_window_input_source_initialized",
+            ("attached", _windowSource is not null), ("visible", IsVisible)));
+    }
+
+    private void RegisterBluetoothControlHotkey()
+    {
+        if (_windowSource is null) return;
+        if (!TryRegisterShortcutSet(GetConfiguredShortcuts(), out var failedAction))
+            _viewModel.AddDiagnosticLog(AppLog.Event("bluetooth_hotkey_register_failed",
+                ("shortcut", GetConfiguredShortcuts()[failedAction].DisplayText),
+                ("error", Marshal.GetLastWin32Error())));
+    }
+
+    private IReadOnlyDictionary<BluetoothShortcutAction, KeyboardShortcut>
+        GetConfiguredShortcuts()
+    {
+        if (_bluetoothShortcuts.Count == 0)
+            foreach (var action in Enum.GetValues<BluetoothShortcutAction>())
+                _bluetoothShortcuts[action] = KeyboardShortcut.DefaultFor(action);
+        return new Dictionary<BluetoothShortcutAction, KeyboardShortcut>(_bluetoothShortcuts);
+    }
+
+    private static int HotKeyId(BluetoothShortcutAction action) => action switch
+    {
+        BluetoothShortcutAction.BluetoothControl => BluetoothModeHotKeyId,
+        BluetoothShortcutAction.WirelessControl => WirelessModeHotKeyId,
+        BluetoothShortcutAction.WiredControl => WiredModeHotKeyId,
+        BluetoothShortcutAction.ControlCenter => BluetoothControlCenterHotKeyId,
+        BluetoothShortcutAction.NotificationCenter => BluetoothNotificationCenterHotKeyId,
+        BluetoothShortcutAction.AppSwitcher => BluetoothAppSwitcherHotKeyId,
+        BluetoothShortcutAction.Home => BluetoothHomeHotKeyId,
+        BluetoothShortcutAction.BossKey => BluetoothBossKeyHotKeyId,
+        BluetoothShortcutAction.Dock => BluetoothDockHotKeyId,
+        BluetoothShortcutAction.Siri => BluetoothSiriHotKeyId,
+        BluetoothShortcutAction.VolumeUp => BluetoothVolumeUpHotKeyId,
+        BluetoothShortcutAction.VolumeDown => BluetoothVolumeDownHotKeyId,
+        BluetoothShortcutAction.LockScreen => BluetoothLockScreenHotKeyId,
+        _ => 0,
+    };
+
+    private void UnregisterConfiguredHotkeys()
+    {
+        if (_windowSource is not null)
+            foreach (var action in Enum.GetValues<BluetoothShortcutAction>())
+                UnregisterHotKey(_windowSource.Handle, HotKeyId(action));
+        _registeredHotKeyIds.Clear();
+    }
+
+    private bool TryRegisterShortcutSet(
+        IReadOnlyDictionary<BluetoothShortcutAction, KeyboardShortcut> shortcuts,
+        out BluetoothShortcutAction failedAction) =>
+        TryRegisterShortcutSetCore(shortcuts, out failedAction, validateAll: false);
+
+    private bool TryRegisterShortcutSetCore(
+        IReadOnlyDictionary<BluetoothShortcutAction, KeyboardShortcut> shortcuts,
+        out BluetoothShortcutAction failedAction, bool validateAll)
+    {
+        failedAction = BluetoothShortcutAction.BluetoothControl;
+        if (!KeyboardShortcut.HaveUniqueBoundValues(shortcuts.Values))
+            return false;
+        foreach (var action in Enum.GetValues<BluetoothShortcutAction>())
+        {
+            if (action == BluetoothShortcutAction.ReverseControl) continue;
+            failedAction = action;
+            if (!shortcuts.TryGetValue(action, out var shortcut) ||
+                !shortcut.IsValidFor(action))
+                return false;
+        }
+        UnregisterConfiguredHotkeys();
+        if (!validateAll)
+        {
+            ConfigureKeyboardShortcuts(shortcuts);
+            ReconcileKeyboardHook();
+            return true;
+        }
+        if (_windowSource is null) return true;
+        foreach (var action in Enum.GetValues<BluetoothShortcutAction>().Where(
+            action => action != BluetoothShortcutAction.ReverseControl))
+        {
+            failedAction = action;
+            var shortcut = shortcuts[action];
+            if (!shortcut.IsBound || shortcut.IsMouse) continue;
+            if (!RegisterHotKey(_windowSource.Handle, HotKeyId(action),
+                    shortcut.RegistrationModifiers, shortcut.VirtualKey))
+            {
+                UnregisterConfiguredHotkeys();
+                return false;
+            }
+            _registeredHotKeyIds.Add(HotKeyId(action));
+        }
+        // Saving probes every keyboard binding, even while the editor owns
+        // focus. A probe must never leave hotkeys active during recording.
+        if (validateAll) UnregisterConfiguredHotkeys();
+        return true;
+    }
+
+    private void ShowShortcutSettings()
+    {
+        if (_shortcutSettingsWindow is not null)
+        {
+            _shortcutSettingsWindow.Activate();
+            _shortcutSettingsWindow.Focus();
+            return;
+        }
+
+        var window = new ShortcutSettingsWindow(GetConfiguredShortcuts(),
+            ApplyBluetoothShortcuts, ConfiguredSettingShortcuts, ApplyShortcutSettings)
+        {
+            Owner = this,
+        };
+        _shortcutSettingsWindow = window;
+        ReleaseSettingShortcutOverrides();
+        UnregisterConfiguredHotkeys();
+        window.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_shortcutSettingsWindow, window))
+            {
+                _shortcutSettingsWindow = null;
+                RegisterBluetoothControlHotkey();
+            }
+        };
+        window.Show();
+    }
+
+    private string? ApplyBluetoothShortcuts(
+        IReadOnlyDictionary<BluetoothShortcutAction, KeyboardShortcut> shortcuts)
+        => ApplyShortcutSettings(shortcuts, ConfiguredSettingShortcuts);
+
+    private string? ApplyShortcutSettings(
+        IReadOnlyDictionary<BluetoothShortcutAction, KeyboardShortcut> shortcuts,
+        IReadOnlyList<SettingShortcutBinding> settingShortcuts)
+    {
+        if (settingShortcuts.Count > 16 || settingShortcuts.Any(binding => binding is null || !binding.IsValid) ||
+            settingShortcuts.Select(binding => binding.Id).Distinct().Count() != settingShortcuts.Count)
+            return LocalizationService.Get("ShortcutSettingsInvalid");
+        var allKeys = shortcuts.Values.Concat(settingShortcuts.Select(binding => binding.Shortcut)).ToArray();
+        if (shortcuts.TryGetValue(BluetoothShortcutAction.BossKey, out var bossKey) && bossKey.IsMouse)
+            return LocalizationService.Get("ShortcutSettingsBossKeyKeyboardOnly");
+        if (_mappingSettings.Mappings.Any(mapping => mapping.Key is { } key &&
+                KeyboardMappingKeys.Conflict(key, allKeys) is not null))
+            return LocalizationService.Get("MappingShortcutConflict");
+        var previous = GetConfiguredShortcuts();
+        if (!KeyboardShortcut.HaveUniqueBoundValues(allKeys))
+            return LocalizationService.Get("ShortcutSettingsDuplicate");
+        if (!TryRegisterShortcutSetCore(shortcuts, out var failedAction, validateAll: true))
+        {
+            _ = TryRegisterShortcutSet(previous, out _);
+            return LocalizationService.Format("ShortcutRegistrationFailedFormat",
+                shortcuts.TryGetValue(failedAction, out var failed)
+                    ? failed.DisplayText : failedAction.ToString());
+        }
+        if (Application.Current is App app)
+        {
+            var snapshot = app.UpdateSettings.Clone();
+            app.UpdateSettings.SettingShortcuts = settingShortcuts.Select(binding => binding with { }).ToList();
+            app.UpdateSettings.BluetoothModeShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.BluetoothControl].VirtualKey;
+            app.UpdateSettings.BluetoothModeShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.BluetoothControl].Modifiers;
+            app.UpdateSettings.BluetoothModeShortcutSchema = 1;
+            app.UpdateSettings.WirelessModeShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.WirelessControl].VirtualKey;
+            app.UpdateSettings.WirelessModeShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.WirelessControl].Modifiers;
+            app.UpdateSettings.WiredModeShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.WiredControl].VirtualKey;
+            app.UpdateSettings.WiredModeShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.WiredControl].Modifiers;
+            app.UpdateSettings.BluetoothControlCenterShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.ControlCenter].VirtualKey;
+            app.UpdateSettings.BluetoothControlCenterShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.ControlCenter].Modifiers;
+            app.UpdateSettings.BluetoothNotificationCenterShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.NotificationCenter].VirtualKey;
+            app.UpdateSettings.BluetoothNotificationCenterShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.NotificationCenter].Modifiers;
+            app.UpdateSettings.BluetoothAppSwitcherShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.AppSwitcher].VirtualKey;
+            app.UpdateSettings.BluetoothAppSwitcherShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.AppSwitcher].Modifiers;
+            app.UpdateSettings.BluetoothHomeShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.Home].VirtualKey;
+            app.UpdateSettings.BluetoothHomeShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.Home].Modifiers;
+            app.UpdateSettings.BluetoothBossShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.BossKey].VirtualKey;
+            app.UpdateSettings.BluetoothBossShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.BossKey].Modifiers;
+            app.UpdateSettings.BluetoothDockShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.Dock].VirtualKey;
+            app.UpdateSettings.BluetoothDockShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.Dock].Modifiers;
+            app.UpdateSettings.BluetoothSiriShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.Siri].VirtualKey;
+            app.UpdateSettings.BluetoothSiriShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.Siri].Modifiers;
+            app.UpdateSettings.BluetoothVolumeUpShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.VolumeUp].VirtualKey;
+            app.UpdateSettings.BluetoothVolumeUpShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.VolumeUp].Modifiers;
+            app.UpdateSettings.BluetoothVolumeDownShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.VolumeDown].VirtualKey;
+            app.UpdateSettings.BluetoothVolumeDownShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.VolumeDown].Modifiers;
+            app.UpdateSettings.BluetoothLockScreenShortcutVirtualKey = (int)shortcuts[BluetoothShortcutAction.LockScreen].VirtualKey;
+            app.UpdateSettings.BluetoothLockScreenShortcutModifiers = (int)shortcuts[BluetoothShortcutAction.LockScreen].Modifiers;
+            app.UpdateSettings.BluetoothShortcutSchema = 6;
+            if (!app.SaveUpdateSettings())
+            {
+                app.RestoreUpdateSettings(snapshot);
+                _ = TryRegisterShortcutSet(previous, out _);
+                return LocalizationService.Get("ShortcutSettingsSaveFailed");
+            }
+        }
+
+        _bluetoothShortcuts.Clear();
+        foreach (var pair in shortcuts) _bluetoothShortcuts[pair.Key] = pair.Value;
+        _ = TryRegisterShortcutSet(shortcuts, out _);
+        BluetoothControlNoticeWindow.NotifyShortcutChanged();
+        _viewModel.AddDiagnosticLog(AppLog.Event("bluetooth_hotkey_updated"));
+        return null;
+    }
+
+    private void OnControlPointerInput(object? sender,
+        Controls.PreviewPointerEventArgs e)
+    {
+        if (_activeControlWindow != 0) return;
+        var udid = _viewModel.SelectedDevice?.Udid;
+        if (!IsUsbControlActive && HandleWindowBluetoothPointer(e, udid)) return;
+        if (TryHandlePointerShortcut(e, udid)) return;
+        if (IsUsbControlActive)
+        {
+            _ = HandleUsbPointerInputAsync(e, _viewModel.SelectedDevice?.Udid);
+            return;
+        }
+        HandleControlPointerInput(e, _viewModel.SelectedDevice?.Udid);
+    }
+
+    private bool TryHandleMouseShortcut(byte button) => button switch
+    {
+        2 => _keyboardRouter.RouteShortcutTrigger((int)KeyboardShortcut.MouseRight),
+        4 => _keyboardRouter.RouteShortcutTrigger((int)KeyboardShortcut.MouseMiddle),
+        8 => _keyboardRouter.RouteShortcutTrigger((int)KeyboardShortcut.MouseXButton1),
+        16 => _keyboardRouter.RouteShortcutTrigger((int)KeyboardShortcut.MouseXButton2),
+        _ => false,
+    };
+
+    private async Task HandleUsbPointerInputAsync(Controls.PreviewPointerEventArgs e,
+        string? sourceUdid)
+    {
+        if (e.Kind == Controls.PreviewPointerKind.Reset && !string.IsNullOrWhiteSpace(sourceUdid))
+            _ = ResetPreviewTouchesAsync(sourceUdid);
+        var usbTargetActive = _viewModel.IsUsbControlTarget(sourceUdid);
+        if (string.IsNullOrWhiteSpace(sourceUdid) ||
+            (e.Kind != Controls.PreviewPointerKind.Reset && !usbTargetActive)) return;
+        if (e.Kind is not (Controls.PreviewPointerKind.Reset or Controls.PreviewPointerKind.TouchUp) &&
+            !CanForwardControlPointer(sourceUdid, GetControlKeyboardWindow(sourceUdid))) return;
+        if (e.Kind is Controls.PreviewPointerKind.TouchDown or Controls.PreviewPointerKind.TouchMove or Controls.PreviewPointerKind.TouchUp)
+        {
+            await HandlePreviewTouchAsync(e, sourceUdid);
+            return;
+        }
+        var state = GetUsbTouchPointerState(sourceUdid);
+        var sourceWidth = e.SourceWidth != 0 ? e.SourceWidth : _viewModel.SourceVideoWidth;
+        var sourceHeight = e.SourceHeight != 0 ? e.SourceHeight : _viewModel.SourceVideoHeight;
+        if (e.Kind == Controls.PreviewPointerKind.Reset)
+        {
+            CancelWheelScroll(state);
+            var wasPressed = state.Pressed;
+            state.Pressed = false;
+            state.PendingMoveQueued = false;
+            state.WheelRemainder = 0;
+            if (wasPressed)
+                await _viewModel.SendUsbTouchAsync("up", state.LastX,
+                    state.LastY, sourceUdid);
+            return;
+        }
+        var canSend = CapturePointerSendGuard(GetControlKeyboardWindow(sourceUdid));
+        if (e.Kind == Controls.PreviewPointerKind.Wheel)
+        {
+            // Velocity-based wheel simulation: the whole scroll gesture is
+            // ONE continuous drag. Wheel events never emit moves themselves
+            // — they only inject velocity, and the drain loop converts that
+            // velocity into evenly paced moves on a fixed frame interval.
+            // Continuous rolling therefore produces one smooth drag instead
+            // of a burst of separate small swipes, and releasing the wheel
+            // lets the velocity decay for a natural ease-out stop. Positive
+            // delta (scroll up) = downward drag (Y increases) on iOS.
+            if (state.Pressed) return;
+            state.WheelRemainder += e.Wheel;
+            var ticks = (int)Math.Truncate(state.WheelRemainder / 120.0);
+            state.WheelRemainder -= ticks * 120.0;
+            if (ticks == 0) return;
+            const double velocityPerTick = 0.45;
+            const double maxVelocity = 2.2;
+            if (!state.WheelActive)
+            {
+                state.WheelCancelled = false;
+                state.WheelActive = true;
+                // Clamp the gesture origin into the safe vertical band with
+                // direction-aware margin: leave room for the initial travel
+                // so the gesture never immediately hits the safe-band edge
+                // and collapses to a zero-distance down→up (which iOS reads
+                // as a tap and opens whatever is under the cursor).
+                if (ticks > 0) // scrolling up = Y increases
+                    state.WheelY = Math.Clamp(state.LastY,
+                        WheelSafeMinY, WheelSafeMaxY - WheelMinGesture);
+                else // scrolling down = Y decreases
+                    state.WheelY = Math.Clamp(state.LastY,
+                        WheelSafeMinY + WheelMinGesture, WheelSafeMaxY);
+                state.WheelNeedsDown = true;
+                state.WheelGestureDistance = 0;
+            }
+            state.WheelVelocity = Math.Clamp(
+                state.WheelVelocity + ticks * velocityPerTick,
+                -maxVelocity, maxVelocity);
+            state.WheelLastDirection = Math.Sign(ticks);
+            if (!state.WheelDraining)
+            {
+                state.WheelDraining = true;
+                _ = DrainWheelAsync(state, sourceUdid, canSend);
+            }
+            return;
+        }
+        if (e.Kind is not (Controls.PreviewPointerKind.Move or
+            Controls.PreviewPointerKind.ButtonDown or Controls.PreviewPointerKind.ButtonUp)) return;
+        var mapped = MapPointerToNormalized(e, sourceWidth, sourceHeight);
+        if (mapped is null)
+        {
+            if (e.Kind == Controls.PreviewPointerKind.ButtonUp && state.Pressed)
+            {
+                state.Pressed = false;
+                state.PendingMoveQueued = false;
+                await _viewModel.SendUsbTouchAsync("up", state.LastX,
+                    state.LastY, sourceUdid);
+            }
+            return;
+        }
+        var position = BluetoothMouseOrientationMapper.MapNormalized(
+            mapped.Value.X, mapped.Value.Y, sourceWidth, sourceHeight, e.Rotation,
+            (Services.BluetoothMouseDirection)_viewModel.ControlPreferencesFor(sourceUdid).PortraitDirection,
+            (Services.BluetoothMouseDirection)_viewModel.ControlPreferencesFor(sourceUdid).LandscapeDirection,
+            _viewModel.ControlPreferencesFor(sourceUdid).ReverseHorizontal,
+            _viewModel.ControlPreferencesFor(sourceUdid).ReverseVertical);
+        if (e.Kind == Controls.PreviewPointerKind.ButtonDown)
+        {
+            CancelWheelScroll(state);
+            state.Pressed = true;
+            // A new contact starts from a clean coalescing state; the down
+            // itself carries the newest position, so any move sampled before
+            // it would only be stale after this point.
+            state.PendingMoveQueued = false;
+        }
+        else if (e.Kind == Controls.PreviewPointerKind.Move && !state.Pressed)
+            return;
+        var action = e.Kind == Controls.PreviewPointerKind.ButtonDown ? "down" :
+            e.Kind == Controls.PreviewPointerKind.ButtonUp ? "up" : "move";
+        if (action == "up") state.Pressed = false;
+        // Publish the sampled position before an asynchronous send, so a
+        // reset cannot release at coordinates from an older gesture.
+        state.LastX = position.X;
+        state.LastY = position.Y;
+        if (action == "move")
+            await SendUsbMoveCoalescedAsync(state, position.X, position.Y, sourceUdid, canSend);
+        else
+            await _viewModel.SendUsbTouchAsync(action, position.X, position.Y, sourceUdid,
+                canSend: canSend);
+    }
+
+    private UsbTouchPointerState GetUsbTouchPointerState(string udid)
+    {
+        if (_usbTouchStates.TryGetValue(udid, out var state)) return state;
+        state = new UsbTouchPointerState();
+        _usbTouchStates.Add(udid, state);
+        return state;
+    }
+
+    private static void CancelWheelScroll(UsbTouchPointerState state)
+    {
+        state.WheelCancelled = state.WheelDraining;
+        state.WheelVelocity = 0;
+        state.WheelRemainder = 0;
+    }
+
+    // Velocity-driven drain for the wheel gesture. Runs on a fixed frame
+    // interval and converts the current velocity into moves, so the contact
+    // glides continuously no matter when wheel events arrive — the whole
+    // gesture is one uninterrupted drag, not one swipe per wheel notch.
+    // Velocity decays every frame; wheel events inject on top, so the
+    // steady-state speed reflects the rolling rate. When the velocity decays
+    // to zero the gesture ends, with a minimum-distance tail so even a
+    // single light tick travels far enough that iOS never reads it as a tap.
+    private async Task DrainWheelAsync(UsbTouchPointerState state,
+        string? sourceUdid, Func<bool> canSend)
+    {
+        const double stopVelocity = 0.05;   // below this the gesture is over
+        const double decayPerFrame = 0.9;   // velocity decay each frame
+        const double maxFrameSeconds = 0.1; // clamp for pathological stalls
+        const double minGesture = 0.08;     // total travel so iOS sees a drag
+        const double tailStep = 0.008;      // per-frame distance while topping up
+        bool CanSendWheel() => !state.WheelCancelled && canSend();
+        try
+        {
+            if (state.WheelNeedsDown)
+            {
+                state.WheelNeedsDown = false;
+                await _viewModel.SendUsbTouchAsync("down", state.LastX,
+                    state.WheelY, sourceUdid, canSend: CanSendWheel);
+            }
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var lastMs = 0.0;
+            while (CanSendWheel())
+            {
+                await Task.Delay(16);
+                if (!CanSendWheel()) break;
+                // Real elapsed time (not the nominal 16 ms) keeps the speed
+                // correct even when the HID tunnel backpressure stretches a
+                // frame beyond its target interval.
+                var frameSeconds = Math.Min(
+                    (stopwatch.Elapsed.TotalMilliseconds - lastMs) / 1000.0,
+                    maxFrameSeconds);
+                lastMs = stopwatch.Elapsed.TotalMilliseconds;
+                state.WheelVelocity *= decayPerFrame;
+                if (Math.Abs(state.WheelVelocity) < stopVelocity)
+                    state.WheelVelocity = 0;
+                if (state.WheelVelocity == 0)
+                {
+                    if (state.WheelGestureDistance >= minGesture ||
+                        state.WheelLastDirection == 0)
+                        break;
+                    // Top up the travel so the gesture never reads as a tap.
+                    // Clamp the tail to the safe band and credit whatever
+                    // travel remains instead of aborting the tail mid-way.
+                    var tailDelta = state.WheelLastDirection *
+                        Math.Min(tailStep,
+                            minGesture - state.WheelGestureDistance);
+                    var tailY = Math.Clamp(state.WheelY + tailDelta,
+                        WheelSafeMinY, WheelSafeMaxY);
+                    var tailTravel = Math.Abs(tailY - state.WheelY);
+                    state.WheelY = tailY;
+                    state.WheelGestureDistance += tailTravel;
+                    if (tailTravel > 0.0005)
+                        await _viewModel.SendUsbTouchAsync("move",
+                            state.LastX, tailY, sourceUdid, canSend: CanSendWheel);
+                    // A tail clamped against the band can no longer move —
+                    // bail out instead of spinning on the same position.
+                    if (state.WheelGestureDistance >= minGesture ||
+                        tailTravel < 0.0005)
+                        break;
+                    continue;
+                }
+                var deltaY = state.WheelVelocity * frameSeconds;
+                var newY = state.WheelY + deltaY;
+                if (newY <= WheelSafeMinY || newY >= WheelSafeMaxY)
+                {
+                    // Hit the safe-band edge: finish the gesture there. The
+                    // origin clamp guarantees at least the band margin of
+                    // travel before this fires, so the gesture stays a drag.
+                    newY = Math.Max(WheelSafeMinY, Math.Min(WheelSafeMaxY,
+                        newY));
+                    state.WheelVelocity = 0;
+                    if (Math.Abs(newY - state.WheelY) > 0.0005)
+                    {
+                        state.WheelGestureDistance +=
+                            Math.Abs(newY - state.WheelY);
+                        state.WheelY = newY;
+                        await _viewModel.SendUsbTouchAsync("move",
+                            state.LastX, newY, sourceUdid, canSend: CanSendWheel);
+                    }
+                    break;
+                }
+                state.WheelY = newY;
+                state.WheelGestureDistance += Math.Abs(deltaY);
+                await _viewModel.SendUsbTouchAsync("move", state.LastX,
+                    newY, sourceUdid, canSend: CanSendWheel);
+            }
+            // Release the contact unless the user has taken it over with a
+            // ButtonDown (race: the button's down must not be undone here).
+            if (!state.Pressed)
+                await _viewModel.SendUsbTouchAsync("up", state.LastX,
+                    state.WheelY, sourceUdid);
+        }
+        finally
+        {
+            state.WheelCancelled = false;
+            state.WheelActive = false;
+            state.WheelNeedsDown = false;
+            state.WheelDraining = false;
+        }
+    }
+
+    // Mouse move events (WM_MOUSEMOVE direct from the message pump) arrive far
+    // faster than the HID tunnel drains them, and the Python bridge processes
+    // touch frames strictly one at a time - each frame waits for the previous
+    // HID round trip. Queueing every intermediate position therefore builds up
+    // latency and the on-device pointer keeps moving after the mouse stops.
+    // Coalesce instead: while a send is in flight keep only the newest sample
+    // and push it once the in-flight send completes. down/up keep their
+    // immediate send because their semantics must not be skipped; the bridge's
+    // five-slot state machine already ignores stale moves that arrive after
+    // the pointer was released, so the Pressed guard here is enough. All state
+    // is per-device so concurrent preview windows cannot corrupt each other.
+    private async Task SendUsbMoveCoalescedAsync(UsbTouchPointerState state,
+        double x, double y, string? sourceUdid, Func<bool> canSend)
+    {
+        state.PendingMoveX = x;
+        state.PendingMoveY = y;
+        state.PendingMoveCanSend = canSend;
+        state.PendingMoveQueued = true;
+        if (state.MoveDraining) return;
+        state.MoveDraining = true;
+        try
+        {
+            while (state.PendingMoveQueued && state.Pressed)
+            {
+                state.PendingMoveQueued = false;
+                await _viewModel.SendUsbTouchAsync("move", state.PendingMoveX,
+                    state.PendingMoveY, sourceUdid, canSend: state.PendingMoveCanSend);
+            }
+        }
+        finally
+        {
+            state.MoveDraining = false;
+        }
+    }
+
+    private static (double X, double Y)? MapPointerToNormalized(
+        Controls.PreviewPointerEventArgs e, uint sourceWidth, uint sourceHeight)
+    {
+        return PreviewCoordinateMapper.Normalize(e.X, e.Y, e.SurfaceWidth, e.SurfaceHeight,
+            sourceWidth, sourceHeight);
+    }
+    private bool HandleWindowBluetoothPointer(Controls.PreviewPointerEventArgs e, string? udid)
+    {
+        if (!_bluetoothWindowMouseEnabled || !IsBluetoothControlActiveFor(udid)) return false;
+        var absolute = _viewModel.BluetoothUsesAbsoluteMouse;
+        var sourceWidth = e.SourceWidth != 0 ? e.SourceWidth : _viewModel.SourceVideoWidth;
+        var sourceHeight = e.SourceHeight != 0 ? e.SourceHeight : _viewModel.SourceVideoHeight;
+        var position = MapPointerToNormalized(e, sourceWidth, sourceHeight);
+        var canForward = CanForwardControlPointer(udid, GetControlKeyboardWindow(udid));
+        if (e.Kind == Controls.PreviewPointerKind.Reset || !canForward || position is null)
+        {
+            ResetWindowBluetoothPointer(udid);
+            return true;
+        }
+        if (absolute)
+        {
+            _viewModel.ConfigureBluetoothAbsoluteDragGeometry(udid!, sourceWidth, sourceHeight, e.Rotation);
+            var surface = (e.SurfaceWidth, e.SurfaceHeight);
+            if (_windowBluetoothPointerInside &&
+                (_windowBluetoothPointerSurface != surface || sourceWidth != _lastControlGeometryWidth ||
+                 sourceHeight != _lastControlGeometryHeight || e.Rotation != _lastControlGeometryRotation))
+                ResetWindowBluetoothPointer(udid);
+            _windowBluetoothPointerSurface = surface;
+            _lastControlGeometryWidth = sourceWidth;
+            _lastControlGeometryHeight = sourceHeight;
+            _lastControlGeometryRotation = e.Rotation;
+        }
+        _windowBluetoothPointerInside = true;
+        if (TryHandlePointerShortcut(e, udid)) return true;
+        // Entering while holding a Windows button must not start an iPad drag.
+        if (e.Kind == Controls.PreviewPointerKind.ButtonUp && (_controlButtons & e.Button) == 0)
+            return true;
+        if (absolute)
+        {
+            _absoluteWindowMousePosition = BluetoothMouseOrientationMapper.MapNormalized(
+                position.Value.X, position.Value.Y, sourceWidth, sourceHeight, e.Rotation,
+                BluetoothMouseDirection.Up, BluetoothMouseDirection.Up, false, false);
+            var previousButtons = _controlButtons;
+            if (e.Kind == Controls.PreviewPointerKind.ButtonDown) _controlButtons |= e.Button;
+            if (e.Kind == Controls.PreviewPointerKind.ButtonUp) _controlButtons &= (byte)~e.Button;
+            // The move/wheel snapshot may clear a missed release, but only
+            // an actual in-picture button-down can start a device gesture.
+            if (e.WindowsButtons is byte held) _controlButtons &= held;
+            var wheel = e.Kind == Controls.PreviewPointerKind.Wheel ? GetBluetoothWheelUnits(e.Wheel) : 0;
+            if (e.Kind != Controls.PreviewPointerKind.Wheel || wheel != 0 || previousButtons != _controlButtons)
+                _ = SendAbsoluteWindowMouseAsync(udid!, wheel);
+        }
+        else
+            HandleControlPointerInput(e, udid);
+        return true;
+    }
+
+    private async Task SendAbsoluteWindowMouseAsync(string udid, int wheel, bool reset = false)
+    {
+        var generation = Volatile.Read(ref _windowBluetoothPointerGeneration);
+        var foreground = CapturePointerSendGuard(GetControlKeyboardWindow(udid));
+        var (x, y) = _absoluteWindowMousePosition;
+        try
+        {
+            await _viewModel.SendBluetoothAbsoluteMouseAsync(x, y, _controlButtons, wheel, udid,
+                () => reset || (generation == Volatile.Read(ref _windowBluetoothPointerGeneration) && foreground()), reset);
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("bluetooth_pointer_flush_failed",
+                ("error", AppLog.Error(error))));
+        }
+    }
+
+    private void ResetWindowBluetoothPointer(string? udid)
+    {
+        if (!_bluetoothWindowMouseEnabled || !_windowBluetoothPointerInside) return;
+        _windowBluetoothPointerInside = false;
+        _controlPointerInitialized = false;
+        _controlRemainderX = _controlRemainderY = 0;
+        var reset = new Controls.PreviewPointerEventArgs(Controls.PreviewPointerKind.Reset, 0, 0, 0, 0);
+        TryHandlePointerShortcut(reset, udid);
+        if (_viewModel.BluetoothUsesAbsoluteMouse && udid is not null)
+        {
+            Interlocked.Increment(ref _windowBluetoothPointerGeneration);
+            _controlButtons = 0;
+            _controlWheelRemainder = 0;
+            _ = SendAbsoluteWindowMouseAsync(udid, 0, reset: true);
+        }
+        else
+            HandleControlPointerInput(reset, udid);
+    }
+
+    private void HandleControlPointerInput(Controls.PreviewPointerEventArgs e,
+        string? sourceUdid = null)
+    {
+        if (Volatile.Read(ref _bluetoothRouteChanging) != 0) return;
+        if (!IsBluetoothControlActiveFor(sourceUdid ??
+            _viewModel.SelectedDevice?.Udid)) return;
+        if (_rawMouseInputEnabled && e.Kind == Controls.PreviewPointerKind.Move)
+            return;
+        if (e.Kind == Controls.PreviewPointerKind.Move)
+        {
+            var sourceWidth = e.SourceWidth != 0 ? e.SourceWidth : _viewModel.SourceVideoWidth;
+            var sourceHeight = e.SourceHeight != 0 ? e.SourceHeight : _viewModel.SourceVideoHeight;
+            var surface = (e.SurfaceWidth, e.SurfaceHeight);
+            var geometryChanged = (_bluetoothWindowMouseEnabled && _windowBluetoothPointerSurface != surface) ||
+                sourceWidth != _lastControlGeometryWidth ||
+                sourceHeight != _lastControlGeometryHeight ||
+                e.Rotation != _lastControlGeometryRotation;
+            _lastControlGeometryWidth = sourceWidth;
+            _lastControlGeometryHeight = sourceHeight;
+            _lastControlGeometryRotation = e.Rotation;
+            _windowBluetoothPointerSurface = surface;
+            var mapped = MapPointerToSource(e,
+                sourceWidth, sourceHeight);
+            if (geometryChanged && _controlPointerInitialized)
+            {
+                // A rotation or source-size change invalidates the previous
+                // absolute coordinate. Re-anchor without emitting a jump.
+                _lastControlSourceX = mapped.X;
+                _lastControlSourceY = mapped.Y;
+                _controlRemainderX = 0;
+                _controlRemainderY = 0;
+                return;
+            }
+            if (!_controlPointerInitialized)
+            {
+                // Relative HID reports have no absolute origin. The first
+                // absolute preview sample only establishes an anchor; using
+                // (0,0) here creates a large synthetic jump and looks like a
+                // stale rectangular movement burst.
+                _lastControlSourceX = mapped.X;
+                _lastControlSourceY = mapped.Y;
+                _controlPointerInitialized = true;
+                return;
+            }
+            var dx = (double)(mapped.X - _lastControlSourceX);
+            var dy = (double)(mapped.Y - _lastControlSourceY);
+            _lastControlSourceX = mapped.X;
+            _lastControlSourceY = mapped.Y;
+            var sensitivity = PointerSensitivity(
+                sourceWidth, sourceHeight) *
+                (_viewModel.ControlPreferencesFor(sourceUdid).MouseSensitivity / 100.0);
+            var oriented = MapMouseDeltaToDeviceOrientation(dx, dy,
+                sourceWidth, sourceHeight,
+                e.Rotation,
+                (Services.BluetoothMouseDirection)_viewModel.ControlPreferencesFor(sourceUdid).PortraitDirection,
+                (Services.BluetoothMouseDirection)_viewModel.ControlPreferencesFor(sourceUdid).LandscapeDirection,
+                _viewModel.ControlPreferencesFor(sourceUdid).ReverseHorizontal,
+                _viewModel.ControlPreferencesFor(sourceUdid).ReverseVertical);
+            dx = oriented.X;
+            dy = oriented.Y;
+            var scaledX = dx * sensitivity + _controlRemainderX;
+            var scaledY = dy * sensitivity + _controlRemainderY;
+            var sendX = (int)Math.Truncate(scaledX);
+            var sendY = (int)Math.Truncate(scaledY);
+            _controlRemainderX = scaledX - sendX;
+            _controlRemainderY = scaledY - sendY;
+            if (sendX != 0 || sendY != 0)
+            {
+                lock (_controlQueueSync)
+                {
+                    DropStalePendingControlMotion();
+                    _pendingControlDx = Math.Clamp(_pendingControlDx + sendX,
+                        -32767, 32767);
+                    _pendingControlDy = Math.Clamp(_pendingControlDy + sendY,
+                        -32767, 32767);
+                    _pendingControlButtons = _controlButtons;
+                    // Keep the timestamp of the first unsent movement. Updating
+                    // it for every packet disguises a multi-second route/UI
+                    // stall as fresh input and releases the entire old burst.
+                    if (_pendingControlMotionAt == 0)
+                        _pendingControlMotionAt = Stopwatch.GetTimestamp();
+                }
+                StartControlPointerTimer();
+            }
+            return;
+        }
+        if (e.Kind == Controls.PreviewPointerKind.Reset)
+        {
+            _controlButtons = 0;
+            _controlWheelRemainder = 0;
+            lock (_controlQueueSync)
+            {
+                Interlocked.Increment(ref _windowBluetoothPointerGeneration);
+                _windowMouseButtonReports.Clear();
+                _pendingControlDx = 0;
+                _pendingControlDy = 0;
+                _pendingControlWheel = 0;
+                _pendingControlMotionAt = 0;
+                _pendingControlButtons = 0;
+                _pendingControlStateDirty = !_bluetoothWindowMouseEnabled;
+                if (_bluetoothWindowMouseEnabled)
+                    _windowMouseButtonReports.Enqueue((0, 0, 0, 0));
+            }
+            StartControlPointerTimer();
+            _ = FlushControlPointerSafeAsync(force: true);
+            return;
+        }
+        if (e.Kind == Controls.PreviewPointerKind.Wheel)
+        {
+            var wheelUnits = GetBluetoothWheelUnits(e.Wheel);
+            if (wheelUnits != 0)
+            {
+                lock (_controlQueueSync)
+                {
+                    // Wheel ticks are disposable relative input. Keep only
+                    // the newest tick while BLE is busy; adding them creates
+                    // delayed scroll bursts after a transport stall.
+                    _pendingControlWheel = wheelUnits;
+                    _pendingControlButtons = _controlButtons;
+                    _pendingControlStateDirty = true;
+                }
+                StartControlPointerTimer();
+                _ = FlushControlPointerSafeAsync();
+            }
+            return;
+        }
+        if (e.Kind == Controls.PreviewPointerKind.ButtonDown)
+            _controlButtons |= e.Button;
+        else
+            _controlButtons = (byte)(_controlButtons & ~e.Button);
+        lock (_controlQueueSync)
+        {
+            if (_bluetoothWindowMouseEnabled)
+            {
+                if (_windowMouseButtonReports.Count >= WindowMouseButtonQueueLimit)
+                {
+                    _windowMouseButtonReports.Clear();
+                    _windowMouseButtonReports.Enqueue((0, 0, 0, 0));
+                    _pendingControlDx = _pendingControlDy = 0;
+                    _pendingControlMotionAt = 0;
+                }
+                _windowMouseButtonReports.Enqueue((_pendingControlDx, _pendingControlDy,
+                    _controlButtons, _pendingControlMotionAt));
+                _pendingControlDx = _pendingControlDy = 0;
+                _pendingControlMotionAt = 0;
+            }
+            else
+                _pendingControlStateDirty = true;
+            _pendingControlButtons = _controlButtons;
+        }
+        StartControlPointerTimer();
+        _ = FlushControlPointerSafeAsync(force: true);
+    }
+
+    private int GetBluetoothWheelUnits(int delta)
+    {
+        if (delta == 0) return 0;
+        var multiplier = Math.Clamp(_viewModel.BluetoothWheelResolutionMultiplier, 1, 10);
+        if (multiplier != _lastWheelResolutionMultiplier)
+        {
+            _controlWheelRemainder = 0;
+            _lastWheelResolutionMultiplier = multiplier;
+        }
+        var unitsPerTick = Math.Max(1, 120 / multiplier);
+        var wheelTotal = _controlWheelRemainder + delta * (_viewModel.ControlPreferencesFor(_activeControlUdid ?? _viewModel.BluetoothControlTargetUdid).WheelSensitivity / 100.0);
+        var wheelUnits = (int)Math.Truncate(wheelTotal / unitsPerTick);
+        _controlWheelRemainder = wheelTotal - wheelUnits * unitsPerTick;
+        return Math.Clamp(-wheelUnits, -127, 127);
+    }
+
+    private void StartControlPointerTimer()
+    {
+        // Do not reset the timer for every raw-input packet. Continuous mouse
+        // motion can otherwise create an immediate callback storm and starve
+        // both WPF and the BLE notification pump.
+        if (Interlocked.Exchange(ref _controlPointerTimerArmed, 1) == 0)
+            _controlPointerTimer.Change(1, 4);
+    }
+
+    private void StopControlPointerTimer()
+    {
+        Interlocked.Exchange(ref _controlPointerTimerArmed, 0);
+        _controlPointerTimer.Change(Timeout.Infinite, Timeout.Infinite);
+    }
+
+    private async Task FlushControlPointerAsync(bool force = false)
+    {
+        if (Interlocked.Exchange(ref _controlPointerFlushInFlight, 1) != 0)
+            return;
+        int dx;
+        int dy;
+        int wheel;
+        byte buttons;
+        long motionAt;
+        try
+        {
+            var routeUdid = _activeControlWindow != 0
+                ? _activeControlUdid
+                : _viewModel.SelectedDevice?.Udid;
+            // Bind input before dequeuing it. A timer worker can be suspended
+            // between this snapshot and transport admission across an F9 cycle.
+            var sourceWindow = _activeControlWindow != 0 ? _activeControlWindow : _windowSource?.Handle ?? 0;
+            var sessionCanSend = _viewModel.CaptureBluetoothInputSendGuard();
+            var canSend = CapturePointerSendGuard(sourceWindow);
+            long windowPointerGeneration;
+            bool preserveButtonTransitions;
+            if (!IsBluetoothControlActiveFor(routeUdid)) return;
+            lock (_controlQueueSync)
+            {
+                windowPointerGeneration = Volatile.Read(ref _windowBluetoothPointerGeneration);
+                preserveButtonTransitions = Volatile.Read(ref _bluetoothWindowMouseEnabled);
+                if (_windowMouseButtonReports.TryDequeue(out var transition))
+                {
+                    (dx, dy, buttons, motionAt) = transition;
+                    wheel = 0;
+                }
+                else
+                {
+                    if (!force && !HasPendingControlPointerInput)
+                    {
+                        StopControlPointerTimer();
+                        return;
+                    }
+                    dx = _pendingControlDx;
+                    dy = _pendingControlDy;
+                    wheel = _pendingControlWheel;
+                    buttons = _pendingControlButtons;
+                    motionAt = _pendingControlMotionAt;
+                    _pendingControlDx = 0;
+                    _pendingControlDy = 0;
+                    _pendingControlWheel = 0;
+                    _pendingControlStateDirty = false;
+                    _pendingControlMotionAt = 0;
+                }
+            }
+            // BLE notifications can occasionally block behind the Bluetooth
+            // stack. Never emit a large, old relative-motion burst after that
+            // stall; it is perceived as the iOS pointer flying past the cursor.
+            if ((dx != 0 || dy != 0) && motionAt != 0)
+            {
+                var ageMs = (Stopwatch.GetTimestamp() - motionAt) * 1000.0 /
+                    Stopwatch.Frequency;
+                if (ageMs > 80) { dx = 0; dy = 0; }
+            }
+            // A blur must still release held buttons on this same session.
+            // Focus resets revoke presses; only F9/session changes revoke this
+            // empty release so it cannot clear a later resumed press.
+            var release = dx == 0 && dy == 0 && buttons == 0 && wheel == 0;
+            await _viewModel.SendBluetoothMouseAsync(dx, dy, buttons, wheel,
+                routeUdid, () => sessionCanSend() && (release ||
+                    (windowPointerGeneration == Volatile.Read(ref _windowBluetoothPointerGeneration) && canSend())),
+                preserveButtonTransitions);
+        }
+        finally
+        {
+            Volatile.Write(ref _controlPointerFlushInFlight, 0);
+            lock (_controlQueueSync)
+            {
+                if (!HasPendingControlPointerInput)
+                    StopControlPointerTimer();
+                else
+                    StartControlPointerTimer();
+            }
+        }
+    }
+
+    // Read while holding _controlQueueSync.
+    private bool HasPendingControlPointerInput => _windowMouseButtonReports.Count != 0 ||
+        _pendingControlDx != 0 || _pendingControlDy != 0 || _pendingControlWheel != 0 ||
+        _pendingControlStateDirty;
+
+    private async Task FlushControlPointerSafeAsync(bool force = false)
+    {
+        try
+        {
+            await FlushControlPointerAsync(force).ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            // Input callbacks are fire-and-forget. Keep transient WinRT
+            // failures out of the WPF input loop and record them for support.
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "bluetooth_pointer_flush_failed", ("error", AppLog.Error(error))));
+        }
+    }
+
+    private void OnIndependentPointerInput(string udid,
+        Controls.PreviewPointerEventArgs e)
+    {
+        if (e.Kind == Controls.PreviewPointerKind.Reset) _ = ResetPreviewTouchesAsync(udid);
+        // Bluetooth Raw Input owns motion, buttons and wheel across both
+        // surfaces. Keep native reset messages, but discard legacy duplicates.
+        if (_rawMouseInputEnabled && IsBluetoothControlActiveFor(udid) &&
+            e.Kind != Controls.PreviewPointerKind.Reset) return;
+        if (!_viewModel.IsUsbControlTarget(udid) && _activeControlWindow != 0 &&
+            HandleWindowBluetoothPointer(e, udid)) return;
+        if (TryHandlePointerShortcut(e, udid)) return;
+        if (_viewModel.IsUsbControlTarget(udid))
+        {
+            _ = HandleUsbPointerInputAsync(e, udid);
+            return;
+        }
+        if (_activeControlWindow == 0 ||
+            !DeviceViewModel.UdidEquals(_activeControlUdid, udid)) return;
+        HandleControlPointerInput(e, udid);
+    }
+
+    private void OnIndependentKeyboardInput(string udid,
+        Controls.PreviewKeyboardEventArgs e)
+    {
+        _viewModel.AddDiagnosticLog(AppLog.Event("independent_keyboard_window_event",
+            ("device", AppLog.Device(udid)), ("kind", e.Kind),
+            ("virtual_key", e.VirtualKey), ("scan_code", e.ScanCode),
+            ("message_time", e.MessageTime), ("repeat", e.IsRepeat),
+            ("received_time", unchecked((uint)Environment.TickCount)),
+            ("active_window", _activeControlWindow)));
+        // The native preview can deliver a key message while the async route
+        // transition is still publishing its active HWND. Route by the event
+        // source and current device ownership instead of dropping that first
+        // key during the transition.
+        if (!_viewModel.IsUsbControlTarget(udid) &&
+            !IsBluetoothControlActiveFor(udid)) return;
+        HandleControlKeyboardInput(e, udid,
+            sourceWindow: _secondaryMirrors.GetWindowHandle(udid));
+    }
+
+    private async void OnIndependentPreviewClosed(string udid)
+    {
+        ReleaseSettingShortcutOverrides(device: udid);
+        HandleControlKeyboardInput(new Controls.PreviewKeyboardEventArgs(
+            Controls.PreviewKeyboardKind.Reset, 0), udid);
+        _ = HandleUsbPointerInputAsync(new Controls.PreviewPointerEventArgs(
+            Controls.PreviewPointerKind.Reset, 0, 0, 0, 0), udid);
+        // MultiDevicePreviewManager removes the window before raising this
+        // event. Restore the main preview even when reverse control was
+        // disabled first and its active-route fields have already been cleared.
+        QueueMainPreviewHostSync();
+        Interlocked.Exchange(ref _bluetoothRouteChanging, 1);
+        await _bluetoothRouteGate.WaitAsync();
+        var closingActiveControlWindow = false;
+        try
+        {
+            closingActiveControlWindow = _activeControlWindow != 0 &&
+                DeviceViewModel.UdidEquals(_activeControlUdid, udid);
+            if (!closingActiveControlWindow)
+            {
+                // Closing a formerly controlled HWND can be the final native
+                // cursor transition. Reassert the inactive state after that
+                // HWND has been destroyed, even though Disable already ran.
+                if (_activeControlWindow == 0 &&
+                    !_viewModel.IsBluetoothControlEnabled && !IsUsbControlActive)
+                    ClearBluetoothControlInputState();
+                return;
+            }
+            _activeControlWindow = 0;
+            _activeControlUdid = null;
+            ClearBluetoothControlInputState();
+            if (_viewModel.IsBluetoothControlEnabled && _viewModel.IsBluetoothControlTarget(udid))
+                await _viewModel.DisableBluetoothControlAsync();
+        }
+        catch (Exception error)
+        {
+            if (closingActiveControlWindow)
+            {
+                _activeControlWindow = 0;
+                _activeControlUdid = null;
+                ClearBluetoothControlInputState();
+            }
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "independent_reverse_control_close_failed",
+                ("device", AppLog.Device(udid)), ("error", AppLog.Error(error))));
+        }
+        finally
+        {
+            Volatile.Write(ref _bluetoothRouteChanging, 0);
+            _bluetoothRouteGate.Release();
+        }
+    }
+
+    private async void OnIndependentReverseControlRequested(string udid, nint window)
+    {
+        Interlocked.Exchange(ref _bluetoothRouteChanging, 1);
+        await _bluetoothRouteGate.WaitAsync();
+        try
+        {
+            ShowReverseControlStatus(ControlStatusMode.Bluetooth, udid, window);
+            ResetControlRouteState();
+            if (_viewModel.IsBluetoothControlEnabled && _activeControlWindow == window)
+            {
+                // The independent-window menu is a toggle.  The complete
+                // workspace already exposes a stop action, so the tray
+                // projection must be able to stop the same session from its
+                // context menu instead of only starting it.
+                await _viewModel.DisableBluetoothControlAsync();
+                _activeControlWindow = 0;
+                _activeControlUdid = null;
+            }
+            else
+            {
+                if (_viewModel.IsBluetoothControlEnabled)
+                    await _viewModel.DisableBluetoothControlAsync();
+                _activeControlWindow = window;
+                _activeControlUdid = udid;
+                await _viewModel.EnableBluetoothControlAsync(udid);
+                if (_viewModel.IsBluetoothControlEnabled)
+                    _secondaryMirrors.PrepareBluetoothControlWindow(udid);
+                if (!_viewModel.IsBluetoothControlEnabled)
+                {
+                    _activeControlWindow = 0;
+                    _activeControlUdid = null;
+                }
+            }
+            if (IsBluetoothControlActiveFor(udid))
+            {
+                // Independent HWNDs can receive focus before the asynchronous
+                // view-model notification reaches the main window. Apply the
+                // same raw-input, cursor clipping, and hidden-cursor policy
+                // used by the main preview so the pointer cannot escape this
+                // surface and click another application.
+                ApplyBluetoothControlInputState(activateIndependentWindow: false);
+            }
+            else
+                ClearBluetoothControlInputState();
+            // The first pointer event in the newly activated native window
+            // establishes the relative-motion anchor.
+            _controlPointerInitialized = false;
+            _lastControlSourceX = 0;
+            _lastControlSourceY = 0;
+            _controlRemainderX = 0;
+            _controlRemainderY = 0;
+            _controlWheelRemainder = 0;
+        }
+        catch (Exception error)
+        {
+            _activeControlWindow = 0;
+            _activeControlUdid = null;
+            ClearBluetoothControlInputState();
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "independent_reverse_control_request_failed",
+                ("device", AppLog.Device(udid)),
+                ("window", AppLog.Handle((ulong)window.ToInt64())),
+                ("error", AppLog.Error(error))));
+        }
+        finally
+        {
+            ResetControlRouteState();
+            Volatile.Write(ref _bluetoothRouteChanging, 0);
+            _bluetoothRouteGate.Release();
+        }
+    }
+
+    private async void OnIndependentUsbControlRequested(string udid, nint window)
+    {
+        try
+        {
+            ShowReverseControlStatus(ControlStatusMode.Usb, udid, window);
+            var device = _viewModel.Devices.FirstOrDefault(candidate =>
+                DeviceViewModel.UdidEquals(candidate.Udid, udid));
+            if (device is null || device.IsMediaCast) return;
+            if (_viewModel.IsUsbControlTarget(udid))
+            {
+                await _viewModel.ToggleWiredControlAsync(udid);
+                ClearBluetoothControlInputState();
+                return;
+            }
+            await _viewModel.StartUsbControlAsync(udid);
+            if (_viewModel.IsUsbControlTarget(udid))
+            {
+                if (_keyboardForegroundWindow() == window) FocusControlDevice(udid, window);
+                _secondaryMirrors.PrepareUsbControlWindow(udid);
+                ApplyBluetoothControlInputState(activateIndependentWindow: false);
+            }
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddUiLog(LocalizationService.Format("UsbControlOperationFailedFormat", error.Message));
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "independent_usb_control_request_failed",
+                ("device", AppLog.Device(udid)), ("error", AppLog.Error(error))));
+        }
+    }
+
+    private async void OnIndependentWirelessControlRequested(string udid, nint window)
+    {
+        try
+        {
+            ShowReverseControlStatus(ControlStatusMode.Wireless, udid, window);
+            if (_viewModel.IsWirelessControlTarget(udid))
+            {
+                await _viewModel.ToggleWirelessControlAsync(udid);
+                ClearBluetoothControlInputState();
+                return;
+            }
+            await _viewModel.StartWirelessControlAsync(udid);
+            if (!_viewModel.IsWirelessControlTarget(udid)) return;
+            if (_keyboardForegroundWindow() == window) FocusControlDevice(udid, window);
+            _secondaryMirrors.PrepareUsbControlWindow(udid);
+            ApplyBluetoothControlInputState(activateIndependentWindow: false);
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddUiLog(LocalizationService.Format("WirelessControlOperationFailedFormat", error.Message));
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "independent_wireless_control_request_failed",
+                ("device", AppLog.Device(udid)), ("error", AppLog.Error(error))));
+        }
+    }
+
+    private static (int X, int Y) MapPointerToSource(
+        Controls.PreviewPointerEventArgs e, uint sourceWidth, uint sourceHeight)
+    {
+        if (sourceWidth == 0 || sourceHeight == 0 || e.SurfaceWidth <= 0 ||
+            e.SurfaceHeight <= 0)
+            return (Math.Max(0, e.X), Math.Max(0, e.Y));
+
+        var sourceAspect = (double)sourceWidth / sourceHeight;
+        var surfaceAspect = (double)e.SurfaceWidth / e.SurfaceHeight;
+        double imageX = 0;
+        double imageY = 0;
+        double imageWidth = e.SurfaceWidth;
+        double imageHeight = e.SurfaceHeight;
+        if (surfaceAspect > sourceAspect)
+        {
+            imageWidth = e.SurfaceHeight * sourceAspect;
+            imageX = (e.SurfaceWidth - imageWidth) / 2;
+        }
+        else if (surfaceAspect < sourceAspect)
+        {
+            imageHeight = e.SurfaceWidth / sourceAspect;
+            imageY = (e.SurfaceHeight - imageHeight) / 2;
+        }
+        var x = Math.Clamp((e.X - imageX) / imageWidth * sourceWidth,
+            0, sourceWidth - 1);
+        var y = Math.Clamp((e.Y - imageY) / imageHeight * sourceHeight,
+            0, sourceHeight - 1);
+        return ((int)Math.Round(x), (int)Math.Round(y));
+    }
+
+    private static double PointerSensitivity(uint sourceWidth, uint sourceHeight)
+    {
+        if (sourceWidth == 0 || sourceHeight == 0) return 1.0 / 3.0;
+        // iPhone screenshots are normally 3x logical pixels; recent iPads are
+        // commonly 2x. HID reports are interpreted in logical pointer units.
+        return Math.Min(sourceWidth, sourceHeight) >= 1400 ? 0.5 : 1.0 / 3.0;
+    }
+
+    private void OnControlKeyboardInput(object? sender,
+        Controls.PreviewKeyboardEventArgs e)
+    {
+        _viewModel.AddDiagnosticLog(AppLog.Event("control_keyboard_window_event",
+            ("kind", e.Kind), ("virtual_key", e.VirtualKey),
+            ("scan_code", e.ScanCode), ("active_window", _activeControlWindow),
+            ("message_time", e.MessageTime), ("repeat", e.IsRepeat),
+            ("received_time", unchecked((uint)Environment.TickCount)),
+            ("selected_device", AppLog.Device(_viewModel.SelectedDevice?.Udid))));
+        if (_activeControlWindow != 0) return;
+        if (_rawKeyboardInputEnabled && e.Kind is not (Controls.PreviewKeyboardKind.Reset or Controls.PreviewKeyboardKind.Text) &&
+            (e.Kind != Controls.PreviewKeyboardKind.Up || _keyboardHook == 0)) return;
+        HandleControlKeyboardInput(e, _viewModel.SelectedDevice?.Udid);
+    }
+
+    private void HandleControlKeyboardInput(
+        Controls.PreviewKeyboardEventArgs e, string? sourceUdid = null,
+        bool fromRawInput = false, nint? sourceWindow = null)
+    {
+        if (e.Kind == Controls.PreviewKeyboardKind.Text)
+        {
+            var target = sourceUdid ?? ActiveInputDeviceUdid;
+            if (DeviceViewModel.UdidEquals(target, ActiveInputDeviceUdid) &&
+                CanForwardControlKeyboard(target, sourceWindow ?? _windowSource?.Handle ?? 0))
+                TryQueueControlText(e.Text ?? string.Empty);
+            return;
+        }
+        if (e.Kind == Controls.PreviewKeyboardKind.Reset)
+        {
+            DispatchControlKeyboardInput(e, sourceUdid, fromRawInput, sourceWindow);
+            return;
+        }
+        if (_keyboardHook != 0)
+        {
+            if (!fromRawInput)
+            {
+                RecoverShortcutPressFromWindow(e, sourceUdid ?? ActiveInputDeviceUdid,
+                    sourceWindow ?? _windowSource?.Handle ?? 0);
+                ReleaseShortcutFromWindow(e, sourceUdid ?? ActiveInputDeviceUdid,
+                    sourceWindow ?? _windowSource?.Handle ?? 0);
+            }
+            return;
+        }
+        if (e.Kind == Controls.PreviewKeyboardKind.Down)
+        {
+            if (!CanForwardControlKeyboard(sourceUdid ?? ActiveInputDeviceUdid,
+                    sourceWindow ?? _windowSource?.Handle ?? 0)) return;
+            if (!IsKeyboardMappingInputModeActive) TryEnterDirectKeyboardInputMode();
+        }
+        var scan = e.ScanCode & 0xFF;
+        RouteKeyboardEvent(new(ModifierKeyIdentity(e.VirtualKey, e.ScanCode), scan, (e.ScanCode & 0x100) != 0),
+            e.Kind == Controls.PreviewKeyboardKind.Down, sourceUdid ?? ActiveInputDeviceUdid,
+            sourceWindow ?? _windowSource?.Handle ?? 0);
+    }
+
+    private async void DispatchControlKeyboardInput(
+        Controls.PreviewKeyboardEventArgs e, string? sourceUdid = null,
+        bool fromRawInput = false, nint? sourceWindow = null, DirectKeyboardRoute? capturedRoute = null)
+    {
+        Dispatcher.VerifyAccess();
+        var routeUdid = sourceUdid ?? ActiveInputDeviceUdid;
+        var keyboardWindow = sourceWindow ?? _windowSource?.Handle ?? 0;
+        if (e.Kind == Controls.PreviewKeyboardKind.Reset)
+        {
+            // A late blur from an old preview cannot reset the new owner.
+            if (DeviceViewModel.UdidEquals(routeUdid, _keyboardStateUdid) ||
+                DeviceViewModel.UdidEquals(routeUdid, ActiveInputDeviceUdid))
+                ResetKeyboardOwnership();
+            return;
+        }
+        if (_keyboardRouter.Mode == KeyboardInputMode.None &&
+            _keyboardRouter.RequestedMode != KeyboardInputMode.None)
+        {
+            _keyboardRouter.Route(KeyboardInputMode.Direct, ModifierKeyIdentity(e.VirtualKey, e.ScanCode),
+                e.Kind == Controls.PreviewKeyboardKind.Down);
+            return;
+        }
+        if (!CanForwardControlKeyboard(routeUdid, keyboardWindow) ||
+            !TryEnterDirectKeyboardInputMode()) return;
+        var route = capturedRoute ?? _viewModel.CaptureDirectKeyboardRoute(routeUdid);
+        if (route is null) return;
+        if (_directKeyboardRoute is { } previous && !previous.SameSession(route))
+        {
+            ResetKeyboardOwnership();
+            if (!IsDirectKeyboardInputModeActive) return;
+        }
+        _directKeyboardRoute = route;
+        _keyboardStateUdid = routeUdid;
+        var down = e.Kind == Controls.PreviewKeyboardKind.Down;
+        var key = ModifierKeyIdentity(e.VirtualKey, e.ScanCode);
+        if (!_keyboardRouter.Route(KeyboardInputMode.Direct, key, down)) return;
+        var canSend = CaptureKeyboardSendGuard(keyboardWindow);
+        await _bluetoothRouteGate.WaitAsync();
+        var routeHeld = true;
+        void ReleaseRoute()
+        {
+            if (!routeHeld) return;
+            routeHeld = false;
+            _bluetoothRouteGate.Release();
+        }
+        try
+        {
+            if (Volatile.Read(ref _bluetoothRouteChanging) != 0 || !canSend() || !route.IsCurrent()) return;
+            if (!TryMapVirtualKey(key, out var usage, out var modifier)) return;
+            if (down)
+            {
+                if (modifier != 0) _controlModifierKeys.Add(key);
+                else if (usage != 0) _controlKeyboardUsages.Add(usage);
+            }
+            else
+            {
+                if (modifier != 0) _controlModifierKeys.Remove(key);
+                else if (usage != 0) _controlKeyboardUsages.Remove(usage);
+            }
+            _controlKeyboardModifiers = ModifierMask(_controlModifierKeys);
+            var bluetooth = route.Transport == "BluetoothDirect";
+            var pasteRequested = false;
+            var pasteIntercepted = !bluetooth && TryInterceptUsbPasteKey(down, usage,
+                _controlKeyboardModifiers, _controlKeyboardUsages, ref _pasteVPending, out pasteRequested);
+            if (pasteRequested)
+            {
+                try
+                {
+                    var text = await ClipboardTextReader.ReadAsync(
+                        _readClipboardText,
+                        () => route.IsCurrent() && canSend());
+                    if (!string.IsNullOrEmpty(text))
+                        await TrackKeyboardSendAsync(_viewModel.SendUsbPasteTextAsync(
+                            text, routeUdid, () => route.IsCurrent() && canSend()));
+                }
+                catch (Exception error)
+                {
+                    _viewModel.AddDiagnosticLog(AppLog.Event("keyboard_paste_failed", ("error", error.Message)));
+                }
+            }
+            if (pasteIntercepted) return;
+            var usages = bluetooth ? _controlKeyboardUsages.ToArray() :
+                _controlKeyboardUsages.Concat(ModifierUsages(_controlModifierKeys)).ToArray();
+            var modifiers = _controlKeyboardModifiers;
+            ReleaseRoute();
+            await TrackKeyboardSendAsync(SendRoutedKeyboardAsync(route, modifiers, usages, canSend));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("control_keyboard_input_failed",
+                ("device", AppLog.Device(routeUdid)), ("owner", route.Transport), ("error", AppLog.Error(error))));
+        }
+        finally { ReleaseRoute(); }
+    }
+    private static bool TryInterceptUsbPasteKey(bool isKeyDown, byte usage,
+        byte modifiers, HashSet<byte> keyboardUsages, ref bool pasteVPending,
+        out bool pasteRequested)
+    {
+        pasteRequested = false;
+        if (usage != 0x19) return false;
+
+        if (isKeyDown)
+        {
+            // Raw Input and the legacy window message can both describe the
+            // same physical key press. Once a paste owns V, suppress every
+            // duplicate or repeat until its matching release.
+            if ((modifiers & 0x11) == 0 && !pasteVPending) return false;
+            keyboardUsages.Remove(usage);
+            if (!pasteVPending)
+            {
+                pasteVPending = true;
+                pasteRequested = true;
+            }
+            return true;
+        }
+
+        if (!pasteVPending) return false;
+        keyboardUsages.Remove(usage);
+        pasteVPending = false;
+        return true;
+    }
+
+    private static IEnumerable<byte> ModifierUsages(IEnumerable<int> modifierKeys) =>
+        modifierKeys.Select(key => key switch
+        {
+            0xA2 => (byte)0xE0, 0xA0 => (byte)0xE1, 0xA4 => (byte)0xE2, 0x5B => (byte)0xE3,
+            0xA3 => (byte)0xE4, 0xA1 => (byte)0xE5, 0xA5 => (byte)0xE6, 0x5C => (byte)0xE7,
+            _ => (byte)0,
+        }).Where(usage => usage != 0);
+
+    private static bool TryMapVirtualKey(int key, out byte usage, out byte modifier) =>
+        DeviceKeyMap.TryMapVirtualKey(key, out usage, out modifier);
+
+    private void OnClosed(object? sender, EventArgs e)
+    {
+        _deviceHubPanel?.Dispose();
+        DisposeKeyboardInputSubscriptions();
+        _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        DisposeKeyboardMapping();
+        DisposeTray();
+        _compactLaunchCancellation.Cancel();
+        _secondaryMirrors.PreviewClosed -= OnCompactPreviewClosed;
+        CancelLightweightWindowWidthAnimation();
+        ReconcileKeyboardHook();
+        ClipCursor(IntPtr.Zero);
+        StopControlPointerTimer();
+        _controlPointerTimer.Dispose();
+        _cursorClipWatchdogTimer.Dispose();
+        RegisterRawInput(false, false);
+        UnregisterConfiguredHotkeys();
+        SetWindowsCursorHidden(false);
+        if (_rawInputBuffer != 0)
+        {
+            Marshal.FreeHGlobal(_rawInputBuffer);
+            _rawInputBuffer = 0;
+            _rawInputBufferSize = 0;
+        }
+        _windowSource?.RemoveHook(WindowMessageHook);
+        _windowSource = null;
+    }
+
+    private nint WindowMessageHook(nint hwnd, int message, nint wParam, nint lParam,
+        ref bool handled)
+    {
+        if (message is 0x0231 or 0x0232) // WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE
+            _horizontalProjectionResize = null;
+        if (message == 0x0046 && lParam != 0 && CanConstrainCompleteWorkspace && GetWindowRect(hwnd, out var completeBounds))
+        {
+            var position = Marshal.PtrToStructure<WorkspaceWindowPosition>(lParam);
+            if ((position.Flags & 0x0001) == 0 && position.Width > 0 && position.Height > 0)
+            {
+                var scale = Math.Max(1, GetDpiForWindow(hwnd)) / 96d;
+                var minimumWidth = CanConstrainCompletePreview
+                    ? GetCompletePreviewMinimumWindowWidth(completeBounds, position.Height, scale)
+                    : GetCompleteWorkspaceMinimumWidth();
+                var minimum = (int)Math.Ceiling(minimumWidth * scale - .001);
+                if (position.Width < minimum)
+                {
+                    if ((position.Flags & 0x0002) == 0 && position.X + position.Width == completeBounds.Right)
+                        position.X = completeBounds.Right - minimum;
+                    position.Width = minimum;
+                    Marshal.StructureToPtr(position, lParam, false);
+                }
+            }
+        }
+        if (message == 0x0214 && lParam != 0 && CanConstrainCompleteWorkspace && GetWindowRect(hwnd, out var completeCurrent))
+        {
+            var proposed = Marshal.PtrToStructure<NativeRect>(lParam);
+            var scale = Math.Max(1, GetDpiForWindow(hwnd)) / 96d;
+            var minimumWidth = CanConstrainCompletePreview
+                ? GetCompletePreviewMinimumWindowWidth(completeCurrent, proposed.Bottom - proposed.Top, scale)
+                : GetCompleteWorkspaceMinimumWidth();
+            var minimum = (int)Math.Ceiling(minimumWidth * scale - .001);
+            if (proposed.Right - proposed.Left < minimum)
+            {
+                if ((int)wParam is 1 or 4 or 7) proposed.Left = proposed.Right - minimum;
+                else proposed.Right = proposed.Left + minimum;
+                Marshal.StructureToPtr(proposed, lParam, false);
+                handled = true;
+                return 1;
+            }
+        }
+        if (message == 0x0046 && lParam != 0 && !_applyingWorkspaceWindowBounds &&
+            CanTrimLightweightWorkspace)
+        {
+            // Constrain the native proposal once, before WPF/DWM and the video
+            // HWND consume it. Applying an oversized frame and correcting it
+            // after layout doubles synchronous resize/measure/present work.
+            var position = Marshal.PtrToStructure<WorkspaceWindowPosition>(lParam);
+            if ((position.Flags & 0x0001) == 0 && position.Width > 0 && position.Height > 0 &&
+                GetWindowRect(hwnd, out var currentBounds))
+            {
+                var scale = Math.Max(1, GetDpiForWindow(hwnd)) / 96d;
+                var height = PreviewPanel.ActualHeight +
+                    (position.Height - (currentBounds.Bottom - currentBounds.Top)) / scale;
+                var currentWidth = currentBounds.Right - currentBounds.Left;
+                var width = (int)Math.Round(CalculateLightweightSnugWidth(height, currentWidth / scale) * scale);
+                if (position.Width > width + 1)
+                {
+                    position.Width = width;
+                    if (width == currentWidth && position.Height == currentBounds.Bottom - currentBounds.Top)
+                        position.Flags |= 0x0001; // SWP_NOSIZE: preserve the existing frame
+                    Marshal.StructureToPtr(position, lParam, false);
+                }
+            }
+        }
+        if (message == 0x0214 && lParam != 0 && CanTrimLightweightWorkspace && GetWindowRect(hwnd, out var current))
+        {
+            // WM_SIZING: constrain the proposed rectangle before Windows paints
+            // the oversized frame, including a corner drag that changes height.
+            var proposed = Marshal.PtrToStructure<NativeRect>(lParam);
+            var scale = Math.Max(1, GetDpiForWindow(hwnd)) / 96d;
+            var edge = (int)wParam;
+            if (edge is 1 or 2 or 3 or 6 && PreviewPanel.ActualHeight > 0)
+            {
+                if (edge is 1 or 2) // WMSZ_LEFT / WMSZ_RIGHT
+                    ScaleLightweightProjectionFromSide(ref proposed, current, scale, fromLeft: edge == 1);
+                else // WMSZ_TOP / WMSZ_BOTTOM
+                    ScaleLightweightProjectionFromVerticalEdge(ref proposed, current, scale, fromTop: edge == 3);
+                Marshal.StructureToPtr(proposed, lParam, false);
+                handled = true;
+                return 1;
+            }
+            var height = PreviewPanel.ActualHeight +
+                ((proposed.Bottom - proposed.Top) - (current.Bottom - current.Top)) / scale;
+            var width = (int)Math.Round(CalculateLightweightSnugWidth(height,
+                (current.Right - current.Left) / scale) * scale);
+            if (proposed.Right - proposed.Left > width + 1)
+            {
+                if (edge is 1 or 4 or 7) proposed.Left = proposed.Right - width;
+                else proposed.Right = proposed.Left + width;
+                Marshal.StructureToPtr(proposed, lParam, false);
+                handled = true;
+                return 1;
+            }
+        }
+        if (message == 0x0046 && (_viewModel.IsCapturing || _mediaCastActive ||
+            _workspaceSurfaceAnimationActive || _lightweightWindowAnimationActive))
+            Controls.NativePreviewHost.DisableClientPixelCopy(lParam, resizeOnly: true);
+        if ((IsBluetoothControlActive || IsUsbControlActive) && _activeControlWindow == 0 &&
+            (message == WmKillFocus || message == WmCancelMode ||
+             message == WmCaptureChanged ||
+             (message == WmActivateApp && wParam == 0)))
+        {
+            ResetMainControlState();
+        }
+        if (message == WmInput &&
+            (IsBluetoothControlActive || IsUsbControlActive) &&
+            (_rawMouseInputEnabled || _rawKeyboardInputEnabled))
+        {
+            if (_rawMouseInputEnabled && GetRawInputType(lParam) == RimTypeMouse)
+                ProcessLatestQueuedRawMouseInput(hwnd, wParam, lParam);
+            else
+            {
+                ProcessRawInput(lParam);
+                // WM_INPUT requires DefWindowProc cleanup after
+                // GetRawInputData. Skipping it leaves raw packets outstanding
+                // in the window manager and eventually replays old movement.
+                _ = DefWindowProcW(hwnd, message, wParam, lParam);
+            }
+            handled = true;
+            return 0;
+        }
+        if (message == WmHotKey)
+        {
+            // Registration is only a settings conflict probe. Never execute a
+            // queued WM_HOTKEY alongside the hook's physical key lifetime.
+            handled = true;
+            return 0;
+        }
+        if (message == WmSetCursor && IsBluetoothMouseCaptured)
+        {
+            SetWindowsCursorHidden(true);
+            ClipWindowsCursorToControlSurface();
+            handled = true;
+            return 1;
+        }
+        if ((message is WmActivateApp or WmSetFocus) && IsBluetoothMouseCaptured)
+        {
+            SetWindowsCursorHidden(true);
+            ClipWindowsCursorToControlSurface();
+        }
+        if (!WindowsAutoPlayGuard.ShouldCancel(message,
+                _viewModel.HasAnyCaptureSession))
+            return 0;
+
+        handled = true;
+        _viewModel.AddDiagnosticLog(AppLog.Event("autoplay_cancelled",
+            ("message", "WM_QUERYCANCELAUTOPLAY"), ("capture", true)));
+        return 1;
+    }
+
+    private void RegisterRawInput(bool mouseEnabled, bool keyboardEnabled)
+    {
+        if (_keyboardHook != 0) keyboardEnabled = false;
+        var hwnd = _windowSource?.Handle ?? 0;
+        if (hwnd == 0) return;
+        if (mouseEnabled == _rawMouseInputEnabled &&
+            keyboardEnabled == _rawKeyboardInputEnabled) return;
+        _rawMouseDeltaTracker.Reset();
+        var deviceSize = (uint)Marshal.SizeOf<RawInputDevice>();
+        var devices = new RawInputDevice[2];
+        devices[0] = new RawInputDevice
+        {
+            UsagePage = 0x01,
+            Usage = 0x02,
+            // Raw Input owns movement, buttons, and wheel events. Suppress
+            // legacy mouse messages only for the relative-mouse Bluetooth
+            // route. USB/wireless control uses normal mouse messages so the
+            // rest of the WPF window remains clickable.
+            Flags = mouseEnabled ? RidevInputSink | RidevNoLegacy : RidevRemove,
+            Target = mouseEnabled ? hwnd : 0,
+        };
+        // The actual preview surface is a native child HWND. Keyboard
+        // messages sent to that HWND do not reliably bubble through WPF, so
+        // select keyboard Raw Input as this window's sole direct ingress while
+        // registered. Legacy messages remain enabled for local WPF controls;
+        // native/WPF forwarding is the fallback only if registration is off.
+        // A keyboard must never use INPUTSINK: background typing belongs to
+        // the foreground application. The routing guard also checks the exact
+        // preview HWND because other windows in this process can be active.
+        devices[1] = new RawInputDevice
+        {
+            UsagePage = 0x01,
+            Usage = 0x06,
+            Flags = keyboardEnabled ? 0u : RidevRemove,
+            Target = keyboardEnabled ? hwnd : 0,
+        };
+        var registered = RegisterRawInputDevices(devices, (uint)devices.Length, deviceSize);
+        _rawMouseInputEnabled = registered && mouseEnabled;
+        _rawKeyboardInputEnabled = registered && keyboardEnabled;
+        _viewModel.AddDiagnosticLog(AppLog.Event("raw_input_registration",
+            ("mouse_enabled", mouseEnabled), ("keyboard_enabled", keyboardEnabled),
+            ("registered", registered),
+            ("keyboard", _rawKeyboardInputEnabled),
+            ("mouse", _rawMouseInputEnabled),
+            ("win32_error", registered ? 0 : Marshal.GetLastWin32Error())));
+        MainPreviewHost.SuppressMouseMove = _rawMouseInputEnabled;
+        MainPreviewHost.SuppressLegacyMouseButtons = _rawMouseInputEnabled;
+        if ((mouseEnabled || keyboardEnabled) && _activeControlWindow == 0)
+        {
+            MainPreviewHost.Focus();
+        }
+        // Clear the previous route's confinement; the caller applies the
+        // bounds of the active surface after registration has completed.
+        ClipCursor(IntPtr.Zero);
+    }
+
+    private void ProcessLatestQueuedRawMouseInput(nint hwnd, nint currentWParam,
+        nint currentLParam)
+    {
+        var latestWParam = currentWParam;
+        var latestLParam = currentLParam;
+        var queued = new NativeMessage();
+        // A continuously moving mouse can keep WM_INPUT queued forever. Bound
+        // one drain pass so the WPF dispatcher gets regular turns for timers,
+        // status-window updates, and the absolute reverse-control deadline.
+        var drained = 0;
+        while (drained++ < 64 && PeekMessageW(ref queued, hwnd, WmInput, WmInput, PmRemove))
+        {
+            if (GetRawInputType(queued.LParam) == RimTypeMouse)
+            {
+                // Discard only stale movement. Preserve button transitions so
+                // a queued release cannot be lost behind a newer move packet.
+                ProcessRawInput(latestLParam, includeMouseMovement: false);
+                _ = DefWindowProcW(hwnd, WmInput, latestWParam, latestLParam);
+                latestWParam = queued.WParam;
+                latestLParam = queued.LParam;
+            }
+            else
+            {
+                // Do not discard keyboard input while draining mouse backlog.
+                ProcessRawInput(queued.LParam);
+                _ = DefWindowProcW(hwnd, WmInput, queued.WParam, queued.LParam);
+            }
+        }
+
+        ProcessRawInput(latestLParam);
+        _ = DefWindowProcW(hwnd, WmInput, latestWParam, latestLParam);
+    }
+
+    private uint GetRawInputType(nint rawInput)
+    {
+        uint size = 0;
+        if (GetRawInputData(rawInput, RidInput, 0, ref size,
+                (uint)Marshal.SizeOf<RawInputHeader>()) == unchecked((uint)-1) ||
+            size < (uint)Marshal.SizeOf<RawInputHeader>())
+            return 0;
+        if (_rawInputBuffer == 0 || _rawInputBufferSize < size)
+        {
+            if (_rawInputBuffer != 0) Marshal.FreeHGlobal(_rawInputBuffer);
+            _rawInputBuffer = Marshal.AllocHGlobal((int)size);
+            _rawInputBufferSize = (int)size;
+        }
+        if (GetRawInputData(rawInput, RidInput, _rawInputBuffer, ref size,
+                (uint)Marshal.SizeOf<RawInputHeader>()) == unchecked((uint)-1))
+            return 0;
+        return (uint)Marshal.ReadInt32(_rawInputBuffer);
+    }
+
+    private void ProcessRawInput(nint rawInput, bool includeMouseMovement = true)
+    {
+        uint size = 0;
+        _ = GetRawInputData(rawInput, RidInput, 0, ref size,
+            (uint)Marshal.SizeOf<RawInputHeader>());
+        if (size == 0) return;
+        if (_rawInputBuffer == 0 || _rawInputBufferSize < size)
+        {
+            if (_rawInputBuffer != 0) Marshal.FreeHGlobal(_rawInputBuffer);
+            _rawInputBuffer = Marshal.AllocHGlobal((int)size);
+            _rawInputBufferSize = (int)size;
+        }
+        if (GetRawInputData(rawInput, RidInput, _rawInputBuffer, ref size,
+                (uint)Marshal.SizeOf<RawInputHeader>()) == unchecked((uint)-1))
+            return;
+        var input = Marshal.PtrToStructure<RawInput>(_rawInputBuffer);
+        if (input.Header.Type == RimTypeKeyboard)
+        {
+            ProcessRawKeyboardInput(input.Keyboard);
+            return;
+        }
+        if (input.Header.Type != RimTypeMouse) return;
+        ProcessRawMouseInput(input, includeMouseMovement);
+    }
+
+    private void ProcessRawMouseInput(RawInput input, bool includeMouseMovement)
+    {
+        // INPUTSINK delivers to the main HWND even when an independent preview
+        // owns control. Accept packets only for that route's foreground window.
+        var target = ActiveInputDeviceUdid;
+        if (!_rawMouseInputEnabled || Volatile.Read(ref _bluetoothRouteChanging) != 0 ||
+            !IsBluetoothControlActiveFor(target) ||
+            !CanForwardControlPointer(target, GetControlKeyboardWindow(target))) return;
+        if (includeMouseMovement)
+        {
+            if (IsBluetoothControlActive)
+                ClipWindowsCursorToControlSurface();
+
+            var sourceWidth = _viewModel.SourceVideoWidth;
+            var sourceHeight = _viewModel.SourceVideoHeight;
+            var rotation = 0;
+            if (_activeControlWindow != 0 &&
+                _secondaryMirrors.TryGetControlGeometry(_activeControlUdid,
+                    out var windowWidth, out var windowHeight, out var windowRotation))
+            {
+                sourceWidth = windowWidth;
+                sourceHeight = windowHeight;
+                rotation = windowRotation;
+            }
+            if (sourceWidth != _lastControlGeometryWidth ||
+                sourceHeight != _lastControlGeometryHeight ||
+                rotation != _lastControlGeometryRotation)
+            {
+                _lastControlGeometryWidth = sourceWidth;
+                _lastControlGeometryHeight = sourceHeight;
+                _lastControlGeometryRotation = rotation;
+                _controlRemainderX = 0;
+                _controlRemainderY = 0;
+            }
+            var virtualDesktop = (input.Mouse.Flags & 2) != 0;
+            var delta = _rawMouseDeltaTracker.Translate(input.Header.Device,
+                input.Mouse.Flags, input.Mouse.LastX, input.Mouse.LastY,
+                GetSystemMetrics(virtualDesktop ? 78 : 0),
+                GetSystemMetrics(virtualDesktop ? 79 : 1));
+            // Relative Raw Input reports physical mouse counts. Do not apply a
+            // source-resolution divisor here: it makes the maximum sensitivity
+            // feel slow and causes large packets to hit the boot-report clamp.
+            var sensitivity = _viewModel.ControlPreferencesFor(_activeControlUdid ?? _viewModel.BluetoothControlTargetUdid).MouseSensitivity / 100.0;
+            var (deviceDx, deviceDy) = MapMouseDeltaToDeviceOrientation(
+                delta.X * sensitivity, delta.Y * sensitivity,
+                sourceWidth, sourceHeight, rotation,
+                (Services.BluetoothMouseDirection)_viewModel.ControlPreferencesFor(_activeControlUdid ?? _viewModel.BluetoothControlTargetUdid).PortraitDirection,
+                (Services.BluetoothMouseDirection)_viewModel.ControlPreferencesFor(_activeControlUdid ?? _viewModel.BluetoothControlTargetUdid).LandscapeDirection,
+                _viewModel.ControlPreferencesFor(_activeControlUdid ?? _viewModel.BluetoothControlTargetUdid).ReverseHorizontal,
+                _viewModel.ControlPreferencesFor(_activeControlUdid ?? _viewModel.BluetoothControlTargetUdid).ReverseVertical);
+            AddRawControlDelta(deviceDx, deviceDy);
+        }
+
+        var flags = input.Mouse.ButtonFlags;
+        if ((flags & RawMouseLeftDown) != 0) HandleRawButton(1, true);
+        if ((flags & RawMouseLeftUp) != 0) HandleRawButton(1, false);
+        if ((flags & RawMouseRightDown) != 0) HandleRawButton(2, true);
+        if ((flags & RawMouseRightUp) != 0) HandleRawButton(2, false);
+        if ((flags & RawMouseMiddleDown) != 0) HandleRawButton(4, true);
+        if ((flags & RawMouseMiddleUp) != 0) HandleRawButton(4, false);
+        if ((flags & RawMouseXButton1Down) != 0) HandleRawButton(8, true);
+        if ((flags & RawMouseXButton1Up) != 0) HandleRawButton(8, false);
+        if ((flags & RawMouseXButton2Down) != 0) HandleRawButton(16, true);
+        if ((flags & RawMouseXButton2Up) != 0) HandleRawButton(16, false);
+        if ((flags & RawMouseWheel) != 0)
+            HandleRawWheel(unchecked((short)input.Mouse.ButtonData));
+
+    }
+
+    private void HandleRawButton(byte button, bool down)
+    {
+        var input = new Controls.PreviewPointerEventArgs(
+            down ? Controls.PreviewPointerKind.ButtonDown :
+                Controls.PreviewPointerKind.ButtonUp,
+            0, 0, button, 0);
+        var target = ActiveInputDeviceUdid;
+        if (TryHandlePointerShortcut(input, target)) return;
+        HandleControlPointerInput(input, target);
+    }
+
+    private void HandleRawWheel(short delta)
+    {
+        if (delta == 0) return;
+        HandleControlPointerInput(new Controls.PreviewPointerEventArgs(
+            Controls.PreviewPointerKind.Wheel, 0, 0, 0, delta), ActiveInputDeviceUdid);
+    }
+
+    private void ResetMainControlState()
+    {
+        if (_bluetoothWindowMouseEnabled)
+            ResetWindowBluetoothPointer(_viewModel.SelectedDevice?.Udid);
+        else
+            HandleControlPointerInput(new Controls.PreviewPointerEventArgs(
+                Controls.PreviewPointerKind.Reset, 0, 0, 0, 0));
+        HandleControlKeyboardInput(new Controls.PreviewKeyboardEventArgs(
+            Controls.PreviewKeyboardKind.Reset, 0));
+    }
+
+    private void ProcessRawKeyboardInput(RawKeyboard keyboard)
+    {
+        if (!_rawKeyboardInputEnabled || _activeControlWindow != 0 ||
+            !CanForwardControlKeyboard(_viewModel.SelectedDevice?.Udid,
+                _windowSource?.Handle ?? 0) ||
+            !TryEnterDirectKeyboardInputMode()) return;
+        var isKeyUp = (keyboard.Flags & 0x01) != 0 || keyboard.Message is 0x0101 or 0x0105;
+        var virtualKey = keyboard.VirtualKey;
+        var kind = isKeyUp ? Controls.PreviewKeyboardKind.Up :
+            Controls.PreviewKeyboardKind.Down;
+        HandleControlKeyboardInput(new Controls.PreviewKeyboardEventArgs(
+                kind, virtualKey, keyboard.MakeCode | ((keyboard.Flags & 0x02) != 0 ? 0x100 : 0)),
+            _activeControlWindow != 0 ? _activeControlUdid :
+                _viewModel.SelectedDevice?.Udid,
+            fromRawInput: true);
+    }
+
+    private static int ModifierKeyIdentity(int virtualKey, int scanCode = 0)
+    {
+        virtualKey = RestoreImeVirtualKey(virtualKey, scanCode);
+        return virtualKey switch
+        {
+            0xA0 or 0xA1 => virtualKey,
+            0xA2 or 0xA3 => virtualKey,
+            0xA4 or 0xA5 => virtualKey,
+            0x10 => scanCode == 0x36 ? 0xA1 : 0xA0,
+            0x11 => scanCode == 0x11D ? 0xA3 : 0xA2,
+            0x12 => scanCode == 0x138 ? 0xA5 : 0xA4,
+            _ => virtualKey,
+        };
+    }
+
+    private static byte ModifierMask(IEnumerable<int> keys)
+    {
+        byte mask = 0;
+        foreach (var usage in ModifierUsages(keys)) mask |= (byte)(1 << (usage - 0xE0));
+        return mask;
+    }
+
+    private void AddRawControlDelta(double dx, double dy)
+    {
+        var scaledX = dx + _controlRemainderX;
+        var scaledY = dy + _controlRemainderY;
+        var sendX = (int)Math.Truncate(scaledX);
+        var sendY = (int)Math.Truncate(scaledY);
+        _controlRemainderX = scaledX - sendX;
+        _controlRemainderY = scaledY - sendY;
+        if (sendX == 0 && sendY == 0) return;
+        lock (_controlQueueSync)
+        {
+            DropStalePendingControlMotion();
+            _pendingControlDx = Math.Clamp(_pendingControlDx + sendX, -32767, 32767);
+            _pendingControlDy = Math.Clamp(_pendingControlDy + sendY, -32767, 32767);
+            _pendingControlButtons = _controlButtons;
+            if (_pendingControlMotionAt == 0)
+                _pendingControlMotionAt = Stopwatch.GetTimestamp();
+        }
+        StartControlPointerTimer();
+    }
+
+    private void DropStalePendingControlMotion()
+    {
+        if (_pendingControlMotionAt == 0) return;
+        var ageMs = (Stopwatch.GetTimestamp() - _pendingControlMotionAt) *
+            1000.0 / Stopwatch.Frequency;
+        if (ageMs <= 50) return;
+        // Relative deltas are disposable. Replaying them after a route or
+        // BLE stall produces the visible rectangular trail and delayed motion.
+        _pendingControlDx = 0;
+        _pendingControlDy = 0;
+        _pendingControlMotionAt = 0;
+    }
+
+    private static (double X, double Y) MapMouseDeltaToDeviceOrientation(
+        double dx, double dy, uint sourceWidth, uint sourceHeight, int rotation,
+        BluetoothMouseDirection portraitDirection,
+        BluetoothMouseDirection landscapeDirection,
+        bool reverseHorizontal, bool reverseVertical) =>
+        BluetoothMouseOrientationMapper.Map(dx, dy, sourceWidth, sourceHeight,
+            rotation, portraitDirection, landscapeDirection,
+            reverseHorizontal, reverseVertical);
+
+    private void OnLoaded(object sender, RoutedEventArgs e)
+    {
+        // Let WPF render the window before Apple/usbmux enumeration runs. A
+        // stalled service or USB re-enumeration must not make the GUI appear
+        // frozen or prevent the user from seeing the current status.
+        StartDeviceServices();
+        ApplyWorkspacePanelState();
+        ApplyApplicationDisplayMode();
+        QueueInitialLightweightWorkspaceFit();
+        _viewModel.AddDiagnosticLog(AppLog.Event("main_window_loaded",
+            ("width", ActualWidth.ToString("F0")),
+            ("height", ActualHeight.ToString("F0"))));
+    }
+
+    private void OnWindowStateChanged(object? sender, EventArgs e)
+    {
+        if (WindowState == WindowState.Minimized)
+        {
+            SettleWorkspaceForEnvironmentChange();
+        }
+        if (!_handlingNativeMaximize && !_isFullScreen &&
+            WindowState == WindowState.Maximized)
+        {
+            _handlingNativeMaximize = true;
+            try
+            {
+                var restoreBounds = _isWindowMaximized
+                    ? _windowMaximizeRestoreBounds
+                    : RestoreBounds;
+                WindowState = WindowState.Normal;
+                if (_isWindowMaximized)
+                    RestoreWindowFromMaximized();
+                else
+                    MaximizeWindow(restoreBounds);
+            }
+            finally
+            {
+                _handlingNativeMaximize = false;
+            }
+            return;
+        }
+        ApplyWindowFramePolicy();
+        ResumeWorkspaceWindowFit();
+    }
+
+    private void ApplyWindowFramePolicy()
+    {
+        var flushToDisplayEdge = _isFullScreen || _isWindowMaximized;
+        WindowCornerPreference = flushToDisplayEdge
+            ? Wpf.Ui.Controls.WindowCornerPreference.DoNotRound
+            : Wpf.Ui.Controls.WindowCornerPreference.Round;
+        WindowBackdropType = flushToDisplayEdge
+            ? Wpf.Ui.Controls.WindowBackdropType.None
+            : Wpf.Ui.Controls.WindowBackdropType.Mica;
+        ThemeService.SetEdgeToEdge(this, flushToDisplayEdge);
+    }
+
+    private void OnAboutClick(object sender, RoutedEventArgs e)
+    {
+        if (Application.Current is App app)
+            app.ShowAboutWindow(this, _viewModel);
+    }
+
+    private void OnNavigateMirroringClick(object sender, RoutedEventArgs e)
+    {
+        if (!_workspaceControlsReady || _isSynchronizingWorkspacePanelControls) return;
+        SetLeftWorkspacePanel(_leftWorkspacePanel == LeftWorkspacePanel.Mirroring
+            ? LeftWorkspacePanel.None
+            : LeftWorkspacePanel.Mirroring);
+    }
+
+    private void OnNavigateDevicesClick(object sender, RoutedEventArgs e)
+    {
+        if (!_workspaceControlsReady || _isSynchronizingWorkspacePanelControls) return;
+        SetLeftWorkspacePanel(_leftWorkspacePanel == LeftWorkspacePanel.Devices
+            ? LeftWorkspacePanel.None
+            : LeftWorkspacePanel.Devices);
+    }
+
+    private void OnNavigateOutputClick(object sender, RoutedEventArgs e)
+        => OnMediaOutputSettingsRequested();
+
+    private void OnNavigateSettingsClick(object sender, RoutedEventArgs e)
+    {
+        if (!_workspaceControlsReady || _isSynchronizingWorkspacePanelControls) return;
+        SetSettingsPanelVisible(!_isSettingsPanelVisible);
+    }
+
+    private void OnNavigateReverseControlClick(object sender, RoutedEventArgs e)
+    {
+        if (_reverseControlWindow is { IsLoaded: true, IsVisible: true })
+        {
+            _reverseControlWindow.Activate();
+            _reverseControlWindow.Focus();
+            return;
+        }
+        _reverseControlWindow = null;
+        try
+        {
+            var window = new DeviceBindingWindow(this, _viewModel.Devices, _viewModel);
+            _reverseControlWindow = window;
+            window.Closed += (_, _) =>
+            {
+                if (ReferenceEquals(_reverseControlWindow, window)) _reverseControlWindow = null;
+            };
+            window.Show();
+            window.Activate();
+        }
+        catch (Exception error)
+        {
+            _reverseControlWindow = null;
+            DiagnosticLogger.Exception("ui", "device_binding_window_open_failed", error);
+            AppPromptWindow.Inform(LocalizationService.Get("DeviceBindingTitle"), LocalizationService.Format("DeviceBindingOpenFailedFormat", error.Message));
+        }
+    }
+
+    private void OnNavigateDriverClick(object sender, RoutedEventArgs e)
+    {
+        if (_viewModel.OpenDriverManagerCommand.CanExecute(null))
+            _viewModel.OpenDriverManagerCommand.Execute(null);
+    }
+
+    private void OnNavigateAboutClick(object sender, RoutedEventArgs e) =>
+        OnAboutClick(sender, e);
+
+    private void OnCloseDevicePanelClick(object sender, RoutedEventArgs e) =>
+        SetLeftWorkspacePanel(LeftWorkspacePanel.None);
+
+    private void OnCloseMirroringPanelClick(object sender, RoutedEventArgs e) =>
+        SetLeftWorkspacePanel(LeftWorkspacePanel.None);
+
+    private void OnCloseSettingsPanelClick(object sender, RoutedEventArgs e) =>
+        SetSettingsPanelVisible(false);
+
+    private void SetLeftWorkspacePanel(LeftWorkspacePanel panel)
+    {
+        if (_leftWorkspacePanel == panel) return;
+        _leftWorkspacePanel = panel;
+        ApplyWorkspacePanelState(animate: IsLoaded && !_isFullScreen);
+        _viewModel.AddDiagnosticLog(AppLog.Event("workspace_left_panel_changed",
+            ("panel", panel.ToString().ToLowerInvariant())));
+    }
+
+    private void SetSettingsPanelVisible(bool visible)
+    {
+        if (_isSettingsPanelVisible == visible) return;
+        _isSettingsPanelVisible = visible;
+        if (visible) _isDeviceHubPanelVisible = false;
+        SynchronizeRightPanelContent();
+        ApplyWorkspacePanelState(animate: IsLoaded && !_isFullScreen);
+        _viewModel.AddDiagnosticLog(AppLog.Event("workspace_settings_panel_changed",
+            ("visible", visible)));
+    }
+
+    private void ApplyWorkspacePanelState(bool animate = false)
+    {
+        animate &= SystemParameters.ClientAreaAnimation && IsVisible && IsLoaded &&
+            WindowState != WindowState.Minimized;
+        var showMirroring = _leftWorkspacePanel == LeftWorkspacePanel.Mirroring;
+        var showDevices = _leftWorkspacePanel == LeftWorkspacePanel.Devices;
+        var showSettings = IsRightWorkspacePanelVisible;
+        var showLeftPanel = showMirroring || showDevices;
+        var previewStartWidth = Math.Min(PreviewPanel.ActualWidth, PreviewPanel.MaxWidth);
+        // A partially revealed panel is not an established viewport. Pinning its
+        // transient width while retargeting the opposite panel prevents it from reopening.
+        var leftInFlight = _workspaceSurfaceAnimationActive &&
+            Math.Abs(_workspaceLeftSurfaceTargetWidth - LeftPanelHost.Width) > .5;
+        var rightInFlight = _workspaceSurfaceAnimationActive &&
+            Math.Abs(_workspaceRightSurfaceTargetWidth - ControlPanel.Width) > .5;
+        // Snapshot the current frame before stopping its clock. ActualWidth
+        // may still describe the preceding Arrange when clicks share a turn.
+        if (_workspaceTransition?.IsRunning == true)
+        {
+            var leftFrame = Math.Min(Math.Max(0, LeftPanelHost.Width), LeftPanelHost.MaxWidth);
+            var rightFrame = Math.Min(Math.Max(0, ControlPanel.Width), ControlPanel.MaxWidth);
+            CancelLightweightWindowWidthAnimation(preserveLayout: true);
+            LeftPanelHost.Width = leftFrame;
+            ControlPanel.Width = rightFrame;
+        }
+        // Capture the already-open opposite card before changing any widths.
+        // Opening another card must never redistribute that existing viewport.
+        var leftWasOpen = LeftPanelHost.Visibility == Visibility.Visible && LeftPanelHost.ActualWidth > 1;
+        var rightWasOpen = ControlPanel.Visibility == Visibility.Visible && ControlPanel.ActualWidth > 1;
+        if (!animate || leftInFlight) _workspacePinnedLeftWidth = 0;
+        if (!animate || rightInFlight) _workspacePinnedRightWidth = 0;
+        if (showSettings && (!rightWasOpen || rightInFlight) && leftWasOpen && !leftInFlight)
+        {
+            _workspacePinnedLeftWidth = showLeftPanel ? LeftPanelHost.ActualWidth : 0;
+            _workspacePinnedRightWidth = 0;
+        }
+        else if (showLeftPanel && (!leftWasOpen || leftInFlight) && rightWasOpen && !rightInFlight)
+        {
+            _workspacePinnedRightWidth = showSettings ? ControlPanel.ActualWidth : 0;
+            _workspacePinnedLeftWidth = 0;
+        }
+        if (!showLeftPanel) _workspacePinnedLeftWidth = 0;
+        if (!showSettings) _workspacePinnedRightWidth = 0;
+        CancelLightweightWindowWidthAnimation(preserveLayout: true);
+        if (!animate) ApplyLightweightPreviewFramePolicy();
+        _isSynchronizingWorkspacePanelControls = true;
+        try
+        {
+            MirroringPanelToggle.IsActive = showMirroring;
+            DevicePanelToggle.IsActive = showDevices;
+            SettingsPanelToggle.IsActive = _isSettingsPanelVisible;
+            DeviceHubPanelToggle.IsActive = _isDeviceHubPanelVisible;
+        }
+        finally { _isSynchronizingWorkspacePanelControls = false; }
+
+        DeviceColumn.Width = GridLength.Auto;
+        ControlColumn.Width = GridLength.Auto;
+        PrepareWorkspacePages(showDevices, showMirroring);
+        // Retarget from the current reveal widths. The previous clock has been
+        // stopped, but expanding to the full layout width here would cause a jump.
+        _preparingWorkspaceReveal = animate;
+        try { UpdateWorkspaceLayout(preserveSurfaceWidths: animate); }
+        finally { _preparingWorkspaceReveal = false; }
+        if (animate)
+        {
+            // A newly opening card must be measured at its final content width
+            // before the reveal starts, never at the old window's leftover space.
+            if (showLeftPanel && !leftWasOpen) LeftPanelHost.ContentWidth = WorkspaceDeviceWidth;
+            if (showSettings && !rightWasOpen) ControlPanel.ContentWidth = WorkspaceRightWidth;
+        }
+        if (!animate)
+        {
+            LeftGapColumn.Width = new GridLength(showLeftPanel ? 18 : 0);
+            RightGapColumn.Width = new GridLength(showSettings ? 18 : 0);
+            SetWorkspaceSurfaceImmediate(LeftPanelHost, showLeftPanel, WorkspaceDeviceWidth);
+            SetWorkspacePageImmediate(DevicePanel, showDevices);
+            SetWorkspacePageImmediate(MirroringPanel, showMirroring);
+            SetWorkspaceSurfaceImmediate(ControlPanel, showSettings, WorkspaceRightWidth);
+            ReleaseLightweightCenterWidth();
+            if (_viewModel.IsLightweightApplicationMode && IsVisible)
+                QueueInitialLightweightWorkspaceFit();
+            return;
+        }
+
+        if (_viewModel.IsLightweightApplicationMode && !_isWindowMaximized &&
+            !_isFullScreen && CenterColumn.ActualWidth > 0 &&
+            new WindowInteropHelper(this).Handle != 0)
+            AnimateLightweightWindowForWorkspace(showLeftPanel, showSettings, previewStartWidth);
+        else
+            AnimateCompleteWorkspace(showLeftPanel, showSettings);
+    }
+    private void AnimateLightweightWindowForWorkspace(bool showLeftPanel,
+        bool showSettings, double previewStartWidth)
+    {
+        if (!_viewModel.IsLightweightApplicationMode || _isFullScreen ||
+            _isWindowMaximized || CenterColumn.ActualWidth <= 0 ||
+            !SystemParameters.ClientAreaAnimation)
+            return;
+
+        CancelLightweightWindowWidthAnimation(preserveLayout: true);
+        DeviceColumn.Width = GridLength.Auto;
+        ControlColumn.Width = GridLength.Auto;
+
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == 0 || !GetWindowRect(handle, out var bounds)) return;
+        var dpi = GetDpiForWindow(handle);
+        var scale = (dpi == 0 ? 96d : dpi) / 96d;
+        var currentWindowWidth = Math.Max(1, bounds.Right - bounds.Left) / scale;
+        var currentLeftWidth = GetLightweightElementWidth(LeftPanelHost);
+        var currentRightWidth = GetLightweightElementWidth(ControlPanel);
+        var currentLeftGap = GetLightweightColumnWidth(LeftGapColumn);
+        var currentRightGap = GetLightweightColumnWidth(RightGapColumn);
+        var currentCenterWidth = Math.Max(1, CenterColumn.ActualWidth);
+        var currentPreviewWidth = PreviewPanel.ActualWidth > 0
+            ? PreviewPanel.ActualWidth
+            : currentCenterWidth;
+
+        _workspaceLeftSurfaceStartWidth = currentLeftWidth;
+        _workspaceLeftSurfaceTargetWidth = showLeftPanel ? WorkspaceDeviceWidth : 0;
+        _workspaceRightSurfaceStartWidth = currentRightWidth;
+        _workspaceRightSurfaceTargetWidth = showSettings ? WorkspaceRightWidth : 0;
+        _workspaceLeftGapStartWidth = currentLeftGap;
+        _workspaceLeftGapTargetWidth = showLeftPanel ? 18 : 0;
+        _workspaceRightGapStartWidth = currentRightGap;
+        _workspaceRightGapTargetWidth = showSettings ? 18 : 0;
+        var baseChromeWidth = GetLightweightFixedChromeWidth(currentWindowWidth);
+        var targetSideWidth = _workspaceLeftSurfaceTargetWidth +
+            _workspaceLeftGapTargetWidth + _workspaceRightGapTargetWidth +
+            _workspaceRightSurfaceTargetWidth;
+        var maximumWindowWidth = GetLightweightMaximumWindowWidth();
+        var targetWindowLeft = bounds.Left;
+        var anchoredMaximumWindowWidth = maximumWindowWidth;
+        if (TryGetLightweightWorkArea(out var workArea, out _))
+        {
+            targetWindowLeft = Math.Clamp(bounds.Left, workArea.Left,
+                Math.Max(workArea.Left, workArea.Right - 1));
+            anchoredMaximumWindowWidth = Math.Min(maximumWindowWidth,
+                Math.Max(1, (workArea.Right - targetWindowLeft) / scale -
+                    LightweightWorkAreaInset));
+        }
+        var hasTargetPanels = showLeftPanel || showSettings;
+        var maximumPreviewWidth = Math.Max(1, anchoredMaximumWindowWidth -
+            baseChromeWidth - targetSideWidth);
+        var hasContentPreviewWidth = TryGetLightweightContentPreviewWidth(
+            maximumPreviewWidth, out var contentPreviewWidth);
+        var canUseNormalPortraitFrame = !hasContentPreviewWidth && hasTargetPanels &&
+            maximumPreviewWidth >= LightweightNormalPortraitPreviewWidth;
+        ApplyLightweightPreviewFramePolicy(canUseNormalPortraitFrame,
+            hasContentPreviewWidth ? contentPreviewWidth : null);
+        var targetPreviewWidth = hasContentPreviewWidth
+            ? contentPreviewWidth
+            : canUseNormalPortraitFrame
+            ? LightweightNormalPortraitPreviewWidth
+            : Math.Min(currentPreviewWidth, maximumPreviewWidth);
+        var requiredPreviewWidth = hasContentPreviewWidth
+            ? contentPreviewWidth
+            : canUseNormalPortraitFrame
+            ? LightweightNormalPortraitPreviewWidth
+            : LightweightMinimumPreviewWidth;
+        // Retarget the preview along with the HWND and sidebars. Applying the
+        // new max width immediately makes an interrupted close jump to fill
+        // the center before the replacement animation has even started.
+        _workspacePreviewStartWidth = Math.Max(1, previewStartWidth);
+        _workspacePreviewTargetWidth = targetPreviewWidth;
+        _workspacePreviewAnimationActive = true;
+        SetLightweightPreviewMaximumWidth(_workspacePreviewStartWidth);
+        var minimumWindowWidth = Math.Max(LightweightMinimumWindowWidth,
+            baseChromeWidth + targetSideWidth + requiredPreviewWidth);
+        _lightweightTargetMinWidth = Math.Min(minimumWindowWidth,
+            anchoredMaximumWindowWidth);
+        if (MinWidth > _lightweightTargetMinWidth || ActualWidth >= _lightweightTargetMinWidth)
+            MinWidth = _lightweightTargetMinWidth;
+        _lightweightWidthNeedsFit = false;
+        _lightweightCenterTargetWidth = targetPreviewWidth;
+        var targetWindowWidth = Math.Min(anchoredMaximumWindowWidth, baseChromeWidth +
+            targetSideWidth + _lightweightCenterTargetWidth);
+        // The center column fills up to the same animated width as its preview.
+        // Spare space from the minimum HWND width stays after the cards rather
+        // than between the preview and the right sidebar.
+        _workspaceSurfaceAnimationActive = true;
+        ReserveLightweightWorkspaceSurface(LeftPanelHost,
+            currentLeftWidth);
+        ReserveLightweightWorkspaceSurface(ControlPanel,
+            currentRightWidth);
+        if (_workspaceLeftSurfaceTargetWidth > 0)
+            LeftPanelHost.Visibility = Visibility.Visible;
+        if (_workspaceRightSurfaceTargetWidth > 0)
+            ControlPanel.Visibility = Visibility.Visible;
+        LeftGapColumn.Width = new GridLength(currentLeftGap);
+        RightGapColumn.Width = new GridLength(currentRightGap);
+        SetLightweightCenterColumnFill();
+        var plannedWindowWidth = Math.Clamp(targetWindowWidth,
+            _lightweightTargetMinWidth, anchoredMaximumWindowWidth);
+        if (!hasTargetPanels && !hasContentPreviewWidth)
+        {
+            // Once the last card closes, the idle preview fills the window.
+            // Include the minimum-window-width surplus in this transition;
+            // releasing the portrait cap only at completion causes a second
+            // abrupt expansion after the sidebar has already stopped moving.
+            _workspacePreviewTargetWidth = Math.Max(1, plannedWindowWidth - baseChromeWidth);
+            _lightweightCenterTargetWidth = _workspacePreviewTargetWidth;
+        }
+        _lightweightWindowStartX = bounds.Left;
+        // Keep the left navigation rail fixed while either workspace panel
+        // expands or contracts. The available width changes to the right.
+        _lightweightWindowTargetX = targetWindowLeft;
+        AnimateLightweightWindowWidth(plannedWindowWidth, preserveCenterWidth: true);
+    }
+
+    private static double GetLightweightElementWidth(FrameworkElement element) =>
+        element.Visibility != Visibility.Visible ? 0 :
+        double.IsFinite(element.Width)
+            ? Math.Min(Math.Max(0, element.Width), element.MaxWidth) :
+                Math.Max(0, element.ActualWidth);
+
+    private static double GetLightweightColumnWidth(ColumnDefinition column) =>
+        column.Width.IsAbsolute ? Math.Max(0, column.Width.Value) :
+            Math.Max(0, column.ActualWidth);
+
+    private static void ReserveLightweightWorkspaceSurface(FrameworkElement element,
+        double width)
+    {
+        element.BeginAnimation(WidthProperty, null);
+        if (width > 0) element.Visibility = Visibility.Visible;
+        element.Width = width;
+    }
+
+    private void RequestLightweightWindowFit()
+    {
+        if (!_viewModel.IsLightweightApplicationMode || _isFullScreen ||
+            _isWindowMaximized || _workspaceSurfaceAnimationActive) return;
+        _lightweightWidthNeedsFit = true;
+        Dispatcher.BeginInvoke(DispatcherPriority.Render, QueueLightweightPreviewWidth);
+    }
+
+    private void SetLightweightWindowWidthImmediately(double targetWidth)
+    {
+        if (!double.IsFinite(targetWidth) || targetWidth <= 0) return;
+        var handle = new WindowInteropHelper(this).Handle;
+        if (!IsLoaded || handle == 0 || !GetWindowRect(handle, out var bounds))
+        {
+            Width = targetWidth;
+            return;
+        }
+
+        var dpi = GetDpiForWindow(handle);
+        var scale = (dpi == 0 ? 96d : dpi) / 96d;
+        var targetPixels = Math.Max(1, (int)Math.Round(targetWidth * scale));
+        if (Math.Abs((bounds.Right - bounds.Left) - targetPixels) <= 1)
+        {
+            Width = targetWidth;
+            return;
+        }
+
+        // A wired QuickTime session can start presenting while WPF processes
+        // its first source-size update. Resize the HWND once instead of
+        // generating a 280 ms WM_SIZE burst that churns the D3D swap chain.
+        _ = SetWindowPos(handle, 0, bounds.Left, bounds.Top, targetPixels,
+            Math.Max(1, bounds.Bottom - bounds.Top), SwpNoZOrder | SwpNoActivate | SwpNoCopyBits);
+        Width = targetWidth;
+    }
+
+    private void QueueInitialLightweightWorkspaceFit()
+    {
+        if (!_viewModel.IsLightweightApplicationMode || _isFullScreen ||
+            _isWindowMaximized) return;
+        if (_lightweightInitialWorkspaceFitQueued) return;
+        _lightweightInitialWorkspaceFitQueued = true;
+        // Complete startup geometry after layout but before input. ContextIdle
+        // can be starved by ongoing UI updates, leaving the first panel action
+        // to animate from an oversized or off-screen startup rectangle.
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        {
+            _lightweightInitialWorkspaceFitQueued = false;
+            if (!_viewModel.IsLightweightApplicationMode || _isFullScreen ||
+                _isWindowMaximized || !IsVisible || WindowState != WindowState.Normal ||
+                _shutdownStarted || _workspaceTransition?.IsRunning == true) return;
+            MainContentGrid.UpdateLayout();
+            FitLightweightWorkspaceImmediately();
+        });
+    }
+
+    // The first WPF layout can contain a large star-column remainder from the
+    // complete-mode startup width. It is content slack, not window chrome.
+    // Commit a final lightweight geometry only after that layout is available.
+    private void FitLightweightWorkspaceImmediately()
+    {
+        if (!_viewModel.IsLightweightApplicationMode || _isFullScreen ||
+            _isWindowMaximized) return;
+
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle == 0 || !GetWindowRect(handle, out var bounds)) return;
+
+        _workspaceWindowFitOnResume = false;
+        CancelLightweightWindowWidthAnimation(preserveLayout: true);
+        var showLeftPanel = _leftWorkspacePanel != LeftWorkspacePanel.None;
+        var showSettings = IsRightWorkspacePanelVisible;
+        var hasPanels = showLeftPanel || showSettings;
+        DeviceColumn.Width = GridLength.Auto;
+        ControlColumn.Width = GridLength.Auto;
+        SetWorkspaceSurfaceImmediate(LeftPanelHost, showLeftPanel, WorkspaceDeviceWidth);
+        SetWorkspaceSurfaceImmediate(ControlPanel, showSettings, WorkspaceRightWidth);
+        LeftGapColumn.Width = new GridLength(showLeftPanel ? 18 : 0);
+        RightGapColumn.Width = new GridLength(showSettings ? 18 : 0);
+        SetLightweightCenterColumnFill();
+        MainContentGrid.UpdateLayout();
+
+        var dpi = GetDpiForWindow(handle);
+        var scale = (dpi == 0 ? 96d : dpi) / 96d;
+        var currentWindowWidth = Math.Max(1, bounds.Right - bounds.Left) / scale;
+        var chromeWidth = GetLightweightFixedChromeWidth(currentWindowWidth);
+        var sideWidth = (showLeftPanel ? WorkspaceDeviceWidth + 18 : 0) +
+            (showSettings ? WorkspaceRightWidth + 18 : 0);
+        var maximumWindowWidth = GetLightweightMaximumWindowWidth();
+        var maximumPreviewWidth = Math.Max(1, maximumWindowWidth - chromeWidth -
+            sideWidth);
+        var hasContentPreviewWidth = TryGetLightweightContentPreviewWidth(
+            maximumPreviewWidth, out var contentPreviewWidth);
+        var useNormalPortraitFrame = !hasContentPreviewWidth && hasPanels &&
+            maximumPreviewWidth >= LightweightNormalPortraitPreviewWidth;
+        var minimumPreviewWidth = hasContentPreviewWidth
+            ? contentPreviewWidth
+            : hasPanels
+            ? LightweightMinimumPreviewWidth
+            : Math.Min(LightweightMinimumPreviewWidth, maximumPreviewWidth);
+        var minimumWindowWidth = Math.Max(LightweightMinimumWindowWidth,
+            chromeWidth + sideWidth + minimumPreviewWidth);
+        _lightweightTargetMinWidth = Math.Min(minimumWindowWidth,
+            maximumWindowWidth);
+        MinWidth = _lightweightTargetMinWidth;
+
+        var targetPreviewWidth = hasContentPreviewWidth
+            ? contentPreviewWidth
+            : useNormalPortraitFrame
+            ? LightweightNormalPortraitPreviewWidth
+            : hasPanels
+                ? maximumPreviewWidth
+                : GetInitialLightweightPreviewWidth(maximumPreviewWidth);
+        var targetWindowWidth = Math.Clamp(chromeWidth + sideWidth +
+            targetPreviewWidth, _lightweightTargetMinWidth, maximumWindowWidth);
+        ApplyLightweightPreviewFramePolicy(useNormalPortraitFrame,
+            hasContentPreviewWidth ? targetPreviewWidth : null);
+        // The shared preview/column MaxWidth already provides the exact source
+        // cap. Do not reintroduce an absolute column from a queued source-size
+        // fit after a user's resize has released it.
+        SetLightweightCenterColumnFill();
+
+        var targetPixels = Math.Max(1, (int)Math.Round(targetWindowWidth * scale));
+        var targetX = bounds.Left;
+        if (TryGetLightweightWorkArea(out var workArea, out _))
+            targetX = Math.Clamp(targetX, workArea.Left, Math.Max(workArea.Left,
+                workArea.Right - targetPixels));
+        _ = SetWindowPos(handle, 0, targetX, bounds.Top, targetPixels,
+            Math.Max(1, bounds.Bottom - bounds.Top), SwpNoZOrder | SwpNoActivate | SwpNoCopyBits);
+        Left = targetX / scale;
+        Top = bounds.Top / scale;
+        Width = targetWindowWidth;
+        _lightweightWidthNeedsFit = false;
+        MainContentGrid.UpdateLayout();
+    }
+
+    private double GetInitialLightweightPreviewWidth(double maximumPreviewWidth)
+    {
+        var aspect = _viewModel.SourceVideoWidth != 0 &&
+            _viewModel.SourceVideoHeight != 0
+            ? (double)_viewModel.SourceVideoWidth / _viewModel.SourceVideoHeight
+            : LightweightDefaultPreviewAspect;
+        var preferredWidth = Math.Max(LightweightMinimumPreviewWidth,
+            Math.Round(Math.Max(520, PreviewPanel.ActualHeight) * aspect));
+        return Math.Min(preferredWidth, maximumPreviewWidth);
+    }
+
+    private static void SetWorkspacePageImmediate(FrameworkElement element, bool visible)
+    {
+        element.BeginAnimation(OpacityProperty, null);
+        if (element.RenderTransform is TranslateTransform transform)
+        {
+            transform.BeginAnimation(TranslateTransform.XProperty, null);
+            transform.X = 0;
+        }
+        element.Opacity = 1;
+        element.IsHitTestVisible = visible;
+        element.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private static void SetWorkspaceSurfaceImmediate(FrameworkElement element,
+        bool visible, double width)
+    {
+        element.BeginAnimation(WidthProperty, null);
+        element.BeginAnimation(OpacityProperty, null);
+        element.Opacity = 1;
+        if (element.RenderTransform is TranslateTransform transform)
+        {
+            transform.BeginAnimation(TranslateTransform.XProperty, null);
+            transform.X = 0;
+        }
+        element.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        element.Width = visible ? width : 0;
+    }
+
+    private void OnThemeSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_themeControlReady || sender is not ComboBox { SelectedValue: string value } ||
+            !Enum.TryParse<AppTheme>(value, ignoreCase: true, out var theme) ||
+            Application.Current is not App app || app.UpdateSettings.Theme == theme)
+            return;
+        var previous = app.UpdateSettings.Theme;
+        app.UpdateSettings.Theme = theme;
+        if (!app.SaveUpdateSettings())
+        {
+            app.UpdateSettings.Theme = previous;
+            _themeControlReady = false;
+            try { ThemeComboBox.SelectedValue = previous.ToString(); }
+            finally { _themeControlReady = true; }
+            _viewModel.ApplicationSettingsStatus = LocalizationService.Get("SetupSaveFailed");
+            return;
+        }
+        _viewModel.ApplicationSettingsStatus = string.Empty;
+        ThemeService.Apply(theme);
+    }
+
+    private void OnMinimizeClick(object sender, RoutedEventArgs e) =>
+        WindowState = WindowState.Minimized;
+
+    private void OnHeaderMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Left) return;
+        if (e.ClickCount == 2)
+        {
+            OnMaximizeClick(sender, e);
+            return;
+        }
+
+        if (_isWindowMaximized)
+        {
+            BeginMaximizedWorkspaceDrag(e);
+            return;
+        }
+        DragWorkspaceWindow();
+    }
+
+    private void DragWorkspaceWindow()
+    {
+        // Keep the configured DWM backdrop for the whole move loop. Changing
+        // Mica/Acrylic to None here makes Windows repaint the client surface
+        // with its default black/white fill before the drag starts, which is
+        // the visible flash users see while moving the window.
+        try { DragMove(); }
+        catch (InvalidOperationException)
+        {
+            // The pointer can be released between the routed event and
+            // DragMove entering its modal move loop.
+        }
+    }
+
+    private void OnMaximizeClick(object sender, RoutedEventArgs e)
+    {
+        if (_isWindowMaximized)
+            RestoreWindowFromMaximized();
+        else
+            MaximizeWindow();
+    }
+
+    private void MaximizeWindow(Rect? restoreBounds = null)
+    {
+        if (_isFullScreen) return;
+        if (_viewModel.IsLightweightApplicationMode)
+        {
+            CancelLightweightWindowWidthAnimation();
+            SizeToContent = SizeToContent.Manual;
+            PreviewPanel.ClearValue(WidthProperty);
+        }
+        if (!_isWindowMaximized)
+        {
+            _windowMaximizeRestoreBounds = restoreBounds ?? new Rect(
+                Left, Top, ActualWidth, ActualHeight);
+        }
+
+        var handle = new WindowInteropHelper(this).Handle;
+        var monitor = MonitorFromWindow(handle, MonitorDefaultToNearest);
+        var monitorInfo = new MonitorInfo
+        {
+            Size = (uint)Marshal.SizeOf<MonitorInfo>(),
+        };
+        if (monitor == 0 || !GetMonitorInfoW(monitor, ref monitorInfo)) return;
+
+        WindowState = WindowState.Normal;
+        _isWindowMaximized = true;
+        ApplyWindowFramePolicy();
+        _ = SetWindowPos(handle, 0,
+            monitorInfo.Monitor.Left, monitorInfo.Monitor.Top,
+            monitorInfo.Monitor.Right - monitorInfo.Monitor.Left,
+            monitorInfo.Monitor.Bottom - monitorInfo.Monitor.Top,
+            SwpNoZOrder | SwpFrameChanged | SwpShowWindow);
+    }
+
+    private void RestoreWindowFromMaximized()
+    {
+        if (!_isWindowMaximized) return;
+        var applyingBounds = _applyingWorkspaceWindowBounds;
+        _applyingWorkspaceWindowBounds = true;
+        try
+        {
+            _isWindowMaximized = false;
+            WindowState = WindowState.Normal;
+            ApplyWindowFramePolicy();
+            Left = _windowMaximizeRestoreBounds.Left;
+            Top = _windowMaximizeRestoreBounds.Top;
+            Width = _windowMaximizeRestoreBounds.Width;
+            Height = _windowMaximizeRestoreBounds.Height;
+        }
+        finally { _applyingWorkspaceWindowBounds = applyingBounds; }
+        ApplyApplicationDisplayMode();
+    }
+
+    private void OnCloseWindowClick(object sender, RoutedEventArgs e) => Close();
+
+    private async void OnClosing(object? sender, CancelEventArgs e)
+    {
+        if (_allowClose) return;
+        e.Cancel = true;
+        if (_shutdownStarted) return;
+        if (TryCloseMainWindowToTray()) return;
+        Action resumeClose = _exitRequested ? ExitApplication : Close;
+        if (Application.Current is not App { IsSystemSessionEnding: true } &&
+            _mappingWindow?.TryCloseEditor(resumeClose) == false) return;
+        _shutdownStarted = true;
+        await ShutdownAutomationAsync();
+        DisposeKeyboardInputSubscriptions();
+        DisposeKeyboardMapping();
+        try { await _keyboardHandoff.WaitAsync(TimeSpan.FromSeconds(2)); }
+        catch (TimeoutException)
+        {
+            DiagnosticLogger.ReverseControlWarning("keyboard_input", "shutdown_release_timeout");
+        }
+        DisposeTray();
+        _compactLaunchCancellation.Cancel();
+        var shutdownTimer = Stopwatch.StartNew();
+        _viewModel.AddDiagnosticLog(AppLog.Event("main_window_closing",
+            ("media_cast", _mediaCastActive),
+            ("independent_media_window", _mediaCastPreviewWindow is not null),
+            ("full_screen", _isFullScreen)));
+        _viewModel.AddDiagnosticLog(AppLog.Event("main_window_shutdown_begin"));
+        _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        _viewModel.Devices.CollectionChanged -= OnDevicesCollectionChanged;
+        _viewModel.DeviceVideoSizeChanged -= OnDeviceVideoSizeChanged;
+        _viewModel.DeviceSessionHandleChanged -= OnDeviceSessionHandleChanged;
+        _viewModel.DeviceProtectionStateChanged -= OnDeviceProtectionStateChanged;
+        _viewModel.MediaCastCommandReceived -= OnMediaCastCommandReceived;
+        _viewModel.MediaCastStopRequested -= OnMediaCastStopRequested;
+        _viewModel.MediaCastAudioSettingsChanged -= OnMediaCastAudioSettingsChanged;
+        _viewModel.ProjectionSettingsRequested -= OnProjectionSettingsRequested;
+        _viewModel.MediaOutputSettingsRequested -= OnMediaOutputSettingsRequested;
+        _refreshTimer.Stop();
+        _mediaCastTimer.Stop();
+        var application = Application.Current;
+        application.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        foreach (Window window in application.Windows.Cast<Window>().ToArray())
+        {
+            try { window.Hide(); }
+            catch (Exception error)
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event(
+                    "shutdown_window_hide_failed",
+                    ("window", window.GetType().Name),
+                    ("error", AppLog.Error(error))));
+            }
+        }
+        try { _mediaCastPreviewWindow?.HideForShutdown(); }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "shutdown_media_preview_hide_failed",
+                ("error", AppLog.Error(error))));
+        }
+        _secondaryMirrors.HideForShutdown();
+        await Dispatcher.Yield(DispatcherPriority.Background);
+        try
+        {
+            try
+            {
+                StopMediaCastPlayback("window_closing");
+            }
+            catch (Exception error)
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("main_window_media_cleanup_failed",
+                    ("error", AppLog.Error(error))));
+                Debug.WriteLine($"iPhoneMirror media shutdown failed: {AppLog.Error(error)}");
+            }
+            try
+            {
+                _projectionSettingsWindow?.Close();
+                _projectionSettingsWindow = null;
+                _mediaOutputSettingsWindow?.Close();
+                _mediaOutputSettingsWindow = null;
+                _secondaryMirrors.Dispose();
+            }
+            catch (Exception error)
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("main_window_preview_cleanup_failed",
+                    ("error", AppLog.Error(error))));
+                Debug.WriteLine($"iPhoneMirror preview-window shutdown failed: {AppLog.Error(error)}");
+            }
+            try
+            {
+                var shutdownLimit = (Application.Current as App)?
+                    .IsSystemSessionEnding == true
+                    ? TimeSpan.FromSeconds(4)
+                    : _viewModel.NormalShutdownTimeout;
+                var shutdown = _viewModel.ShutdownAsync();
+                try
+                {
+                    await shutdown.WaitAsync(shutdownLimit);
+                }
+                catch (TimeoutException)
+                {
+                    _viewModel.AddDiagnosticLog(AppLog.Event(
+                        "main_window_shutdown_timeout",
+                        ("elapsed_ms", shutdownTimer.ElapsedMilliseconds),
+                        ("limit_ms", shutdownLimit.TotalMilliseconds),
+                        ("system_session_ending", (Application.Current as App)?
+                            .IsSystemSessionEnding == true)));
+                    // Observe a late completion without keeping the WPF close
+                    // path alive. Process termination is the only reliable
+                    // escape when a third-party USB kernel call never returns.
+                    _ = shutdown.ContinueWith(task =>
+                    {
+                        if (task.Exception is not null)
+                            DiagnosticLogger.Exception("shutdown",
+                                "late_shutdown_failed",
+                                task.Exception.GetBaseException());
+                    }, TaskScheduler.Default);
+                }
+            }
+            catch (Exception error)
+            {
+                // Window shutdown must complete even if a broken USB stack reports
+                // an error after the explicit stop/dispose attempts have run.
+                _viewModel.AddDiagnosticLog(AppLog.Event("main_window_core_shutdown_failed",
+                    ("elapsed_ms", shutdownTimer.ElapsedMilliseconds),
+                    ("error", AppLog.Error(error))));
+                Debug.WriteLine($"iPhoneMirror core shutdown failed: {AppLog.Error(error)}");
+            }
+        }
+        finally
+        {
+            Debug.WriteLine($"iPhoneMirror main window close dispatch completed in " +
+                $"{shutdownTimer.ElapsedMilliseconds} ms");
+            _allowClose = true;
+            application.Shutdown(0);
+        }
+    }
+
+    private void OnMediaCastCommandReceived(MediaCastRequest request)
+    {
+        try
+        {
+            _mediaCommandId = request.CommandId;
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_command_received",
+                ("id", request.CommandId), ("type", request.Command),
+                ("flags", request.Flags),
+                ("duration", request.Duration.ToString("F3")),
+                ("position", request.StartPosition.ToString("F3")),
+                ("volume", request.Volume.ToString("F3")),
+                ("active", _mediaCastActive), ("opened", _mediaOpened)));
+            switch (request.Command)
+            {
+            case MediaCastCommand.Stop:
+                StopMediaCastPlayback("remote_command");
+                _viewModel.AddUiLog(LocalizationService.Get("MediaCastStopped"));
+                break;
+            case MediaCastCommand.Play:
+                PlayMediaCast(request);
+                _viewModel.AddUiLog(LocalizationService.Get("MediaCastPlayReceived"));
+                break;
+            case MediaCastCommand.Pause:
+                if (_mediaCastActive)
+                {
+                    SetMediaCastTimelineRunning(false);
+                    _mediaShouldPlay = false;
+                    if (_mediaOpened) MediaCastMediaElement.Pause();
+                    _mediaCastAudioDecoder.Stop();
+                    _mediaPlaying = false;
+                    UpdateMediaCastStatistics();
+                    UpdateMediaCastControls();
+                    ReportMediaCastPlayback();
+                    _viewModel.AddDiagnosticLog(AppLog.Event("media_pause_applied",
+                        ("id", request.CommandId), ("position", _mediaStartPosition),
+                        ("opened", _mediaOpened)));
+                }
+                break;
+            case MediaCastCommand.Resume:
+                if (_mediaCastActive)
+                {
+                    if (_mediaTerminalStatus != MediaCastPlaybackStatus.Unknown)
+                    {
+                        SetLocalMediaCastPlayback(shouldPlay: true);
+                        break;
+                    }
+                    _mediaShouldPlay = true;
+                    if (_mediaOpened) MediaCastMediaElement.Play();
+                    RestartMediaCastAudioAtCurrentPosition();
+                    _mediaPlaying = _mediaOpened;
+                    SynchronizeMediaCastTimelineClock();
+                    UpdateMediaCastStatistics();
+                    UpdateMediaCastControls();
+                    ReportMediaCastPlayback();
+                    _viewModel.AddDiagnosticLog(AppLog.Event("media_resume_applied",
+                        ("id", request.CommandId), ("position", _mediaStartPosition),
+                        ("opened", _mediaOpened)));
+                }
+                break;
+            case MediaCastCommand.Seek:
+                if (_mediaCastActive)
+                {
+                    var target = ClampMediaPosition(request.StartPosition,
+                        clampToDuration: true);
+                    // iQIYI sends a small position correction immediately
+                    // after MediaOpened (for example target=1 while the local
+                    // stream is already around 1-2 seconds). Treat that as a
+                    // startup sync acknowledgement; otherwise it needlessly
+                    // tears down and restarts the HLS bridge. Larger or later
+                    // seeks still take the exact requested programme position.
+                    SeekMediaCastToPosition(target,
+                        allowCoalesce: IsLikelyMediaCastStartupSeek(target));
+                    _viewModel.AddDiagnosticLog(AppLog.Event("media_seek_applied",
+                        ("id", request.CommandId), ("target", target),
+                        ("opened", _mediaOpened)));
+                }
+                break;
+            case MediaCastCommand.Volume:
+                if (_mediaCastActive)
+                {
+                    var volume = double.IsFinite(request.Volume)
+                        ? Math.Clamp(request.Volume, 0, 1) : 1;
+                    var muteSpecified = request.Flags.HasFlag(
+                        MediaCastFlags.MuteSpecified);
+                    var muted = request.Flags.HasFlag(MediaCastFlags.Muted);
+                    MediaCastMediaElement.Volume = volume;
+                    if (muteSpecified) MediaCastMediaElement.IsMuted = muted;
+                    _viewModel.UpdateMediaCastAudioControls(
+                        !MediaCastMediaElement.IsMuted, volume);
+                    UpdateMediaCastStatistics();
+                    UpdateMediaCastControls();
+                    if (_mediaOpened) ReportMediaCastPlayback();
+                    _viewModel.AddDiagnosticLog(AppLog.Event("media_volume_applied",
+                        ("id", request.CommandId), ("volume", volume),
+                        ("mute_specified", muteSpecified),
+                        ("muted", MediaCastMediaElement.IsMuted),
+                        ("opened", _mediaOpened)));
+                }
+                break;
+            }
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_command_applied",
+                ("id", request.CommandId), ("type", request.Command),
+                ("active", _mediaCastActive), ("opened", _mediaOpened),
+                ("playing", _mediaPlaying)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_command_failed",
+                ("id", request.CommandId), ("type", request.Command),
+                ("error", AppLog.Error(error))));
+            if (request.Command == MediaCastCommand.Play)
+            {
+                if (_mediaCastActive) StopMediaCastPlayback("command_failed");
+                // A rejected Play still exists in the receiver's command
+                // state. Explicitly acknowledge it with the upstream stop
+                // protocol even when no local media card was created.
+                _viewModel.RequestMediaCastStop(allowInactive: true);
+            }
+            _viewModel.AddUiLog(LocalizationService.Format(
+                "MediaCastPlaybackFailedFormat", AppLog.Error(error.Message)));
+        }
+    }
+
+    private void OnMediaCastStopRequested()
+    {
+        try
+        {
+            StopMediaCastPlayback("native_stop_request");
+            _viewModel.AddUiLog(LocalizationService.Get("MediaCastStopped"));
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_stop_request_applied",
+                ("active", _mediaCastActive)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_stop_request_failed",
+                ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror media stop event failed: {AppLog.Error(error)}");
+        }
+    }
+
+    private void OnMediaCastAudioSettingsChanged(bool enabled, double volume)
+    {
+        try
+        {
+            MediaCastMediaElement.IsMuted = !enabled;
+            MediaCastMediaElement.Volume = Math.Clamp(volume, 0, 1);
+            UpdateMediaCastStatistics();
+            UpdateMediaCastControls();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_audio_applied",
+                ("enabled", enabled), ("volume", volume.ToString("F3")),
+                ("opened", _mediaOpened)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(
+                AppLog.Event("media_audio_control_failed",
+                    ("error", AppLog.Error(SanitizeMediaError(error.Message),
+                        error.GetType().Name))));
+        }
+    }
+
+    private void PlayMediaCast(MediaCastRequest request)
+    {
+        if (!Uri.TryCreate(request.Url, UriKind.Absolute, out var source) ||
+            source.Scheme is not ("http" or "https"))
+            throw new InvalidOperationException(LocalizationService.Get("MediaCastInvalidUrl"));
+
+        _mediaCastAudioDecoder.Stop();
+        ResetMediaRecoveryCancellation();
+        var generation = _mediaCastEvents.BeginGeneration();
+        ++_mediaRecoveryRevision;
+        // Every new source owns a new bridge, including HLS -> native media
+        // and replacements whose backend fails to start.
+        DisposeHlsMediaBridge();
+        DisposeMediaHttpProxyBridge();
+        // The sender's explicit duration is programme metadata, including
+        // short ads. Only WMF's segment-derived duration needs the 30s filter.
+        _mediaProgramDuration = NormalizeMediaDuration(request.Duration);
+        _mediaStartPosition = MediaCastPlaybackControls.ClampPosition(
+            request.StartPosition, _mediaProgramDuration);
+        _mediaObservedPosition = _mediaStartPosition;
+        _mediaPositionRegressionSinceUtc = default;
+        _mediaLastTimelineDuration = _mediaProgramDuration;
+        _mediaLastTimelinePosition = _mediaStartPosition;
+        _mediaBridgeOffset = _mediaStartPosition;
+        SetMediaCastTimelinePosition(_mediaStartPosition, running: false);
+        _lastRejectedMediaPosition = 0;
+        _mediaProgressSampleUtc = DateTime.UtcNow;
+        ClearMediaCastPendingHlsSeek();
+        ClearMediaCastPendingSeek();
+        _mediaSeekLoading = false;
+        _mediaSeekInteraction = false;
+        _mediaSeekCommitPending = false;
+        _mediaSeekTrackInteraction = false;
+        _mediaSeekInteractionTarget = _mediaStartPosition;
+        _mediaPlaying = false;
+        _mediaShouldPlay = true;
+        _mediaTerminalStatus = MediaCastPlaybackStatus.Unknown;
+        _mediaPrematureEndRetried = false;
+        _mediaOpened = false;
+        _mediaStopped = false;
+        _mediaCastActive = true;
+        _mediaSource = source;
+        _mediaPlaybackSource = source;
+        _mediaBuffering = false;
+        _mediaWaitingForFirstFrame = true;
+        _mediaOpeningPosition = _mediaStartPosition;
+        _mediaOpenedAtUtc = DateTime.UtcNow;
+        var volume = double.IsFinite(request.Volume)
+            ? Math.Clamp(request.Volume, 0, 1) : 1;
+        var muteSpecified = request.Flags.HasFlag(MediaCastFlags.MuteSpecified);
+        var muted = muteSpecified && request.Flags.HasFlag(MediaCastFlags.Muted);
+        var audioEnabled = !muted;
+        _mediaUsesHlsBridge = MediaSourceClassifier.IsLikelyLive(source);
+        _mediaIsLive = _mediaUsesHlsBridge;
+        if (_mediaIsLive)
+        {
+            _mediaHlsBridge = HlsMediaPlaybackBridge.TryStart(source,
+                _mediaStartPosition, message =>
+                _viewModel.AddDiagnosticLog(AppLog.Event("hls_bridge",
+                    ("message", AppLog.Error(message)))),
+                duration => QueueHlsProgramDuration(
+                    generation, source, duration));
+            if (_mediaHlsBridge is null)
+            {
+                // Never fall back to WPF's native HLS path. WMF exposes each
+                // HLS segment as a short clip and reports MediaEnded at the
+                // segment boundary, which makes the sender restart at zero.
+                _mediaUsesHlsBridge = false;
+                _mediaIsLive = false;
+                throw new InvalidOperationException(
+                    LocalizationService.Get("MediaCastHlsBackendUnavailable"));
+            }
+            _mediaPlaybackSource = _mediaHlsBridge.PlaybackUri;
+        }
+        else
+        {
+            _mediaPlaybackSource = ResolveNativeMediaCastSource(source);
+        }
+        _mediaRecoveryBackoff.Reset();
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_play_begin",
+            ("command", request.CommandId),
+            ("source", AppLog.MediaSource(source)),
+            ("likely_live", _mediaIsLive),
+            ("duration", _mediaProgramDuration.ToString("F3")),
+            ("generation", generation),
+            ("start_position", _mediaStartPosition.ToString("F3")),
+            ("volume", volume.ToString("F3")),
+            ("mute_specified", muteSpecified), ("muted", muted)));
+        _viewModel.BeginMediaCast(volume);
+        if (muteSpecified)
+            _viewModel.UpdateMediaCastAudioControls(audioEnabled, volume);
+        if (!ReplaceMediaCastMediaElement(_mediaPlaybackSource, generation,
+                audioEnabled, volume))
+        {
+            StopMediaCastPlayback("backend_bind_rejected");
+            return;
+        }
+        ShowMediaCastStatus("MediaCastLoadingVideo");
+        _mediaOpeningTimer.Start();
+        UpdateMediaCastControls();
+        SynchronizeMainPreviewHost();
+        if (IsTrayMode) ShowMediaCastPreviewWindow();
+        else
+        {
+            if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+            Activate();
+        }
+        if (_mediaHlsBridge is null) MediaCastMediaElement.Play();
+        _mediaPlaybackTimer.Start();
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_play_submitted",
+            ("command", request.CommandId), ("generation", generation),
+            ("source", AppLog.MediaSource(source))));
+    }
+
+    private void StopMediaCastPlayback(string reason = "unspecified")
+    {
+        var wasActive = _mediaCastActive;
+        var command = _mediaCommandId;
+        var source = AppLog.MediaSource(_mediaSource);
+        var stopTimer = Stopwatch.StartNew();
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_stop_begin",
+            ("reason", reason), ("active", wasActive),
+            ("command", command), ("source", source),
+            ("opened", _mediaOpened), ("playing", _mediaPlaying)));
+        try
+        {
+            StopMediaCastPlaybackCore();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_stop_complete",
+                ("reason", reason), ("was_active", wasActive),
+                ("command", command), ("elapsed_ms", stopTimer.ElapsedMilliseconds),
+                ("success", true)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_stop_failed",
+                ("reason", reason), ("was_active", wasActive),
+                ("command", command), ("elapsed_ms", stopTimer.ElapsedMilliseconds),
+                ("error", AppLog.Error(error))));
+            ForceMediaCastStopped(error);
+        }
+    }
+
+    private void StopMediaCastPlaybackCore()
+    {
+        _mediaOpeningTimer.Stop();
+        CancelMediaRecovery();
+        _mediaCastEvents.Invalidate();
+        ++_mediaRecoveryRevision;
+        if (!_mediaStopped)
+        {
+            _mediaStopped = true;
+            _mediaPlaying = false;
+            _mediaShouldPlay = false;
+            _mediaOpened = false;
+            _mediaBuffering = false;
+            _mediaWaitingForFirstFrame = false;
+            _mediaSeekInteraction = false;
+            _mediaSeekCommitPending = false;
+            _mediaSeekTrackInteraction = false;
+            _mediaSeekInteractionTarget = 0;
+            _mediaSeekLoading = false;
+            _lastSeekSliderSyncPosition = double.NaN;
+            ClearMediaCastPendingHlsSeek();
+            ClearMediaCastPendingSeek();
+            _mediaPlaybackTimer.Stop();
+            ReportMediaCastPlayback();
+            try
+            {
+                MediaCastMediaElement.Stop();
+                MediaCastMediaElement.Source = null;
+            }
+            catch (InvalidOperationException error)
+            {
+                _viewModel.AddDiagnosticLog(
+                    $"media_close_failed error={SanitizeMediaError(error.Message)}");
+            }
+        }
+        _mediaCastActive = false;
+        _mediaCastAudioDecoder.Stop();
+        _mediaIsLive = false;
+        _mediaUsesHlsBridge = false;
+        _mediaProgramDuration = 0;
+        _mediaBridgeOffset = 0;
+        ResetMediaCastTimelineClock();
+        _mediaLastTimelineDuration = 0;
+        _mediaLastTimelinePosition = 0;
+        _mediaSource = null;
+        _mediaPlaybackSource = null;
+        DisposeHlsMediaBridge();
+        DisposeMediaHttpProxyBridge();
+        _lastRejectedMediaPosition = 0;
+        _mediaProgressSampleUtc = default;
+        _mediaRecoveryBackoff.Reset();
+        _mediaCommandId = 0;
+        var previewWindow = _mediaCastPreviewWindow;
+        _mediaCastPreviewWindow = null;
+        try
+        {
+            previewWindow?.Dispose();
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(
+                $"media_preview_close_failed error={SanitizeMediaError(error.Message)}");
+        }
+        MediaCastSurface.Visibility = Visibility.Collapsed;
+        ResetMediaCastControls();
+        _viewModel.EndMediaCast();
+        MainPreviewHost.ClearValue(VisibilityProperty);
+        SynchronizeMainPreviewHost();
+    }
+
+    private void ForceMediaCastStopped(Exception cause)
+    {
+        Debug.WriteLine($"iPhoneMirror media cleanup failed: {AppLog.Error(cause)}");
+        try
+        {
+            _viewModel.AddDiagnosticLog(
+                $"media_cleanup_failed error={SanitizeMediaError(cause.Message)}");
+        }
+        catch (Exception error)
+        {
+            Debug.WriteLine($"iPhoneMirror media cleanup logging failed: {AppLog.Error(error)}");
+        }
+
+        CancelMediaRecovery();
+        _mediaCastEvents.Invalidate();
+        ++_mediaRecoveryRevision;
+        _mediaStopped = true;
+        _mediaPlaying = false;
+        _mediaShouldPlay = false;
+        _mediaOpened = false;
+        _mediaCastActive = false;
+        _mediaCastAudioDecoder.Stop();
+        _mediaIsLive = false;
+        _mediaUsesHlsBridge = false;
+        _mediaProgramDuration = 0;
+        _mediaBridgeOffset = 0;
+        ResetMediaCastTimelineClock();
+        _mediaLastTimelineDuration = 0;
+        _mediaLastTimelinePosition = 0;
+        _mediaBuffering = false;
+        _mediaWaitingForFirstFrame = false;
+        _mediaSeekInteraction = false;
+        _mediaSeekCommitPending = false;
+        _mediaSeekTrackInteraction = false;
+        _mediaSeekInteractionTarget = 0;
+        _mediaSeekLoading = false;
+        _lastSeekSliderSyncPosition = double.NaN;
+        ClearMediaCastPendingHlsSeek();
+        ClearMediaCastPendingSeek();
+        _mediaSource = null;
+        _mediaPlaybackSource = null;
+        DisposeHlsMediaBridge();
+        DisposeMediaHttpProxyBridge();
+        _lastRejectedMediaPosition = 0;
+        _mediaProgressSampleUtc = default;
+        _mediaRecoveryBackoff.Reset();
+        _mediaCommandId = 0;
+        try { _mediaPlaybackTimer.Stop(); }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_force_cleanup_step_failed",
+                ("step", "timer"), ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror media timer cleanup failed: {AppLog.Error(error)}");
+        }
+        try
+        {
+            MediaCastMediaElement.Stop();
+            MediaCastMediaElement.Source = null;
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_force_cleanup_step_failed",
+                ("step", "source"), ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror media source cleanup failed: {AppLog.Error(error)}");
+        }
+        var previewWindow = _mediaCastPreviewWindow;
+        _mediaCastPreviewWindow = null;
+        try { previewWindow?.Dispose(); }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_force_cleanup_step_failed",
+                ("step", "window"), ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror media window cleanup failed: {AppLog.Error(error)}");
+        }
+        try { MediaCastSurface.Visibility = Visibility.Collapsed; }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_force_cleanup_step_failed",
+                ("step", "surface"), ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror media surface cleanup failed: {AppLog.Error(error)}");
+        }
+        try { ResetMediaCastControls(); }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_force_cleanup_step_failed",
+                ("step", "controls"), ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror media controls cleanup failed: {AppLog.Error(error)}");
+        }
+        try { _viewModel.EndMediaCast(); }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_force_cleanup_step_failed",
+                ("step", "state"), ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror media state cleanup failed: {AppLog.Error(error)}");
+        }
+        try
+        {
+            MainPreviewHost.ClearValue(VisibilityProperty);
+            SynchronizeMainPreviewHost();
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_force_cleanup_step_failed",
+                ("step", "preview_host"), ("error", AppLog.Error(error))));
+            Debug.WriteLine($"iPhoneMirror preview host cleanup failed: {AppLog.Error(error)}");
+        }
+    }
+
+    private bool ReplaceMediaCastMediaElement(Uri source, long generation,
+        bool audioEnabled, double volume)
+    {
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_backend_replace_begin",
+            ("generation", generation), ("source", AppLog.MediaSource(source)),
+            ("audio", audioEnabled), ("volume", volume.ToString("F3"))));
+        var replacement = new MediaElement
+        {
+            LoadedBehavior = MediaState.Manual,
+            UnloadedBehavior = MediaState.Manual,
+            Stretch = Stretch.Uniform,
+            ScrubbingEnabled = true,
+            IsMuted = !audioEnabled,
+            Volume = double.IsFinite(volume) ? Math.Clamp(volume, 0, 1) : 1,
+            // WMF can throw MILAVERR_UNEXPECTEDWMPFAILURE when SpeedRatio is
+            // assigned before MediaOpened on an HLS MPEG-TS stream. Apply the
+            // selected rate after opening, with a pause/play transaction.
+            SpeedRatio = 1.0,
+        };
+        replacement.MediaOpened += (sender, _) =>
+            OnMediaCastMediaOpened(sender, generation);
+        replacement.MediaEnded += (sender, _) =>
+            OnMediaCastMediaEnded(sender, generation);
+        replacement.MediaFailed += (sender, e) =>
+            OnMediaCastMediaFailed(sender, e, generation);
+        replacement.BufferingStarted += (sender, _) =>
+            OnMediaCastBufferingStarted(sender, generation);
+        replacement.BufferingEnded += (sender, _) =>
+            OnMediaCastBufferingEnded(sender, generation);
+        if (!_mediaCastEvents.TryBind(generation, replacement))
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_backend_replace_rejected",
+                ("generation", generation), ("reason", "stale_generation")));
+            return false;
+        }
+
+        var previous = MediaCastMediaElement;
+        MediaCastVideoHost.Children.Clear();
+        MediaCastVideoHost.Children.Add(replacement);
+        MediaCastMediaElement = replacement;
+        try
+        {
+            previous.Stop();
+        }
+        catch (InvalidOperationException error)
+        {
+            _viewModel.AddDiagnosticLog(
+                $"media_previous_source_stop_failed error={SanitizeMediaError(error.Message)}");
+        }
+        try
+        {
+            previous.Source = null;
+        }
+        catch (InvalidOperationException error)
+        {
+            _viewModel.AddDiagnosticLog(
+                $"media_previous_source_clear_failed error={SanitizeMediaError(error.Message)}");
+        }
+        if (_mediaHlsBridge is { } bridge && Equals(source, bridge.PlaybackUri))
+        {
+            // WMF has its own HTTP response deadline. Prepare remote probes
+            // and the bounded startup buffer before giving it a local URL,
+            // so a healthy slow source does not leave an abandoned GET.
+            _ = BindPreparedMediaCastSourceAsync(replacement, source, generation,
+                bridge, _mediaRecoveryCancellation.Token);
+        }
+        else
+            replacement.Source = source;
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_backend_replace_complete",
+            ("generation", generation), ("source", AppLog.MediaSource(source))));
+        return true;
+    }
+
+    private async Task BindPreparedMediaCastSourceAsync(MediaElement mediaElement,
+        Uri source, long generation, HlsMediaPlaybackBridge bridge,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            // Complete the caller's Loading/timer setup before a cached
+            // preparation result can report failure or bind a source.
+            await Task.Yield();
+            if (cancellationToken.IsCancellationRequested || _shutdownStarted ||
+                !ReferenceEquals(bridge, _mediaHlsBridge) ||
+                !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+            await bridge.WaitUntilReadyAsync(cancellationToken);
+            if (cancellationToken.IsCancellationRequested || _shutdownStarted ||
+                !ReferenceEquals(bridge, _mediaHlsBridge) ||
+                !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+            mediaElement.Source = source;
+            if (_mediaShouldPlay) mediaElement.Play();
+            else mediaElement.Pause();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_backend_source_ready",
+                ("generation", generation), ("stage", bridge.StartupStage)));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception error)
+        {
+            if (_shutdownStarted || !ReferenceEquals(bridge, _mediaHlsBridge) ||
+                !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+            RecoverOrStopAfterMediaEventFailure("startup", error, mediaElement, generation);
+        }
+    }
+
+    private void DisposeHlsMediaBridge()
+    {
+        var bridge = _mediaHlsBridge;
+        _mediaHlsBridge = null;
+        try { bridge?.Dispose(); }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("hls_bridge_dispose_failed",
+                ("error", AppLog.Error(error))));
+        }
+    }
+
+    private bool IsCurrentMediaCastEvent(MediaElement mediaElement, long generation) =>
+        _mediaCastActive && _mediaSource is not null &&
+        _mediaTerminalStatus == MediaCastPlaybackStatus.Unknown &&
+        _mediaCastEvents.IsCurrent(generation, mediaElement);
+
+    private void OnMediaCastBufferingStarted(object? sender, long generation)
+    {
+        if (sender is not MediaElement mediaElement ||
+            !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        _mediaBuffering = true;
+        SetMediaCastTimelineRunning(false);
+        ShowMediaCastStatus("MediaCastLoadingVideo");
+        UpdateMediaCastControls(mediaElement);
+        ReportMediaCastPlayback();
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_buffering_started",
+            ("generation", generation),
+            ("position", ReadMediaCastPosition(mediaElement).ToString("F3"))));
+    }
+
+    private void OnMediaCastBufferingEnded(object? sender, long generation)
+    {
+        if (sender is not MediaElement mediaElement ||
+            !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        _mediaBuffering = false;
+        SynchronizeMediaCastTimelineClock();
+        if (!_mediaWaitingForFirstFrame)
+            MediaCastStatusPanel.Visibility = Visibility.Collapsed;
+        UpdateMediaCastControls(mediaElement);
+        ReportMediaCastPlayback();
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_buffering_ended",
+            ("generation", generation),
+            ("position", ReadMediaCastPosition(mediaElement).ToString("F3"))));
+    }
+
+    private void OnMediaCastMediaOpened(object? sender, long generation)
+    {
+        if (sender is not MediaElement mediaElement ||
+            !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        try
+        {
+            CompleteMediaCastMediaOpened(mediaElement, generation);
+        }
+        catch (Exception error)
+        {
+            RecoverOrStopAfterMediaEventFailure(
+                "opened", error, mediaElement, generation);
+        }
+    }
+
+    private void CompleteMediaCastMediaOpened(
+        MediaElement mediaElement, long generation)
+    {
+        if (!IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        ++_mediaRecoveryRevision;
+        _mediaOpeningTimer.Stop();
+        _mediaOpened = true;
+        _mediaRecoveryBackoff.MarkOpened(_mediaStartPosition);
+        _mediaLastActualPosition = _mediaStartPosition;
+        _mediaLastActualAdvanceUtc = DateTime.UtcNow;
+        _mediaPositionRegressionSinceUtc = default;
+        var hasFixedDuration = mediaElement.NaturalDuration.HasTimeSpan &&
+            mediaElement.NaturalDuration.TimeSpan > TimeSpan.Zero;
+        var naturalDuration = hasFixedDuration
+            ? mediaElement.NaturalDuration.TimeSpan.TotalSeconds : 0;
+        // WMF reports the current HLS segment as a short fixed-duration clip.
+        // Keep segmented sources in the recovery path until a duration large
+        // enough to be a real program duration is available.
+        var segmentedSource = _mediaSource is not null &&
+            MediaSourceClassifier.IsLikelyLive(_mediaSource);
+        if (_mediaProgramDuration <= 0 &&
+            MediaCastPlaybackControls.IsReliableDuration(segmentedSource,
+                naturalDuration))
+            _mediaProgramDuration = naturalDuration;
+        var hasReliableDuration = _mediaProgramDuration > 0 ||
+            MediaCastPlaybackControls.IsReliableDuration(segmentedSource,
+                naturalDuration);
+        _mediaIsLive = segmentedSource && !hasReliableDuration;
+        _mediaStartPosition = ClampMediaPosition(_mediaStartPosition,
+            clampToDuration: true);
+        // Pause before applying the pending position. WMF can reset a new
+        // HTTP source to zero when Pause follows its initial seek.
+        if (!_mediaShouldPlay) mediaElement.Pause();
+        if (_mediaStartPosition > 0 && _mediaHlsBridge is null)
+        {
+            try
+            {
+                mediaElement.Position = TimeSpan.FromSeconds(_mediaStartPosition);
+                BeginMediaCastPendingSeek(_mediaStartPosition);
+            }
+            catch (InvalidOperationException error)
+            {
+                _viewModel.AddDiagnosticLog(
+                    $"media_initial_seek_ignored position={_mediaStartPosition:F3} " +
+                    $"error={SanitizeMediaError(error.Message)}");
+                _mediaStartPosition = 0;
+            }
+        }
+        if (_mediaShouldPlay) mediaElement.Play();
+        _mediaPlaying = _mediaShouldPlay;
+        // Keep the requested programme position as the loading anchor. WMF's
+        // newly-opened HLS element may briefly report zero or a segment-local
+        // timestamp before its first frame is actually presented.
+        _mediaOpeningPosition = ClampMediaPosition(
+            _mediaPendingHlsSeekPosition ?? _mediaStartPosition,
+            clampToDuration: true);
+        _mediaOpenedAtUtc = DateTime.UtcNow;
+        _mediaProgressSampleUtc = _mediaOpenedAtUtc;
+        _mediaWaitingForFirstFrame = _mediaShouldPlay;
+        if (_mediaPlaybackSpeed != 1.0)
+            ApplyMediaCastSpeed(mediaElement, _mediaPlaybackSpeed);
+        SynchronizeMediaCastTimelineClock();
+        if (_mediaWaitingForFirstFrame || _mediaBuffering)
+            ShowMediaCastStatus("MediaCastLoadingVideo");
+        else
+            MediaCastStatusPanel.Visibility = Visibility.Collapsed;
+        if (mediaElement.NaturalVideoWidth > 0 &&
+            mediaElement.NaturalVideoHeight > 0)
+            _mediaCastPreviewWindow?.SetSourceDimensions(
+                (uint)mediaElement.NaturalVideoWidth,
+                (uint)mediaElement.NaturalVideoHeight);
+        UpdateMediaCastStatistics(mediaElement);
+        UpdateMediaCastControls(mediaElement);
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_opened",
+            ("generation", generation), ("source", AppLog.MediaSource(_mediaSource)),
+            ("live", _mediaIsLive),
+            ("duration_seconds", _mediaProgramDuration.ToString("F3")),
+            ("size", $"{mediaElement.NaturalVideoWidth}x{mediaElement.NaturalVideoHeight}"),
+            ("start_position", _mediaStartPosition.ToString("F3")),
+            ("should_play", _mediaShouldPlay)));
+        ReportMediaCastPlayback();
+    }
+
+    private void OnMediaCastMediaEnded(object? sender, long generation)
+    {
+        if (sender is not MediaElement mediaElement ||
+            !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        try
+        {
+            CompleteMediaCastMediaEnded(mediaElement, generation);
+        }
+        catch (Exception error)
+        {
+            RecoverOrStopAfterMediaEventFailure(
+                "ended", error, mediaElement, generation);
+        }
+    }
+
+    private void CompleteMediaCastMediaEnded(
+        MediaElement mediaElement, long generation)
+    {
+        if (!IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        AdvanceImplicitMediaProgress(mediaElement);
+        var endedPosition = ReadMediaCastPosition(mediaElement);
+        if (!_mediaIsLive)
+            SetMediaCastTimelinePosition(Math.Max(_mediaObservedPosition,
+                Math.Max(_mediaStartPosition, ClampMediaPosition(endedPosition))), running: false);
+        // A running FFmpeg bridge is a continuous transport. MediaElement can
+        // still emit a spurious EOF while its MPEG-TS input is reconnecting;
+        // keep the cast session alive and let the bridge own HLS recovery.
+        if (_mediaHlsBridge is { IsRunning: true })
+        {
+            _mediaOpened = true;
+            _mediaPlaying = _mediaShouldPlay;
+            _mediaBuffering = false;
+            _mediaWaitingForFirstFrame = false;
+            SynchronizeMediaCastTimelineClock();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_ended_ignored",
+                ("generation", generation), ("position", endedPosition.ToString("F3")),
+                ("reason", "hls_bridge_running")));
+            try
+            {
+                if (_mediaShouldPlay) mediaElement.Play();
+            }
+            catch (InvalidOperationException error)
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("hls_bridge_resume_failed",
+                    ("error", AppLog.Error(error))));
+            }
+            UpdateMediaCastStatistics(mediaElement);
+            UpdateMediaCastControls(mediaElement);
+            ReportMediaCastPlayback();
+            var checkRevision = ++_mediaBridgeEndCheckRevision;
+            _ = CheckMediaCastBridgeEndAsync(mediaElement, generation,
+                _mediaHlsBridge, endedPosition, checkRevision,
+                _mediaRecoveryCancellation.Token);
+            return;
+        }
+        if (_mediaHlsBridge is not null)
+        {
+            if (!_mediaHlsBridge.ExitedSuccessfully)
+            {
+                RememberImplicitMediaProgress(endedPosition);
+                ShowMediaCastStatus("MediaCastLoadingVideo");
+                QueueLiveMediaRecovery("HLS bridge exited with an error");
+                return;
+            }
+            // The bridge has reached the actual end of the HLS output. This
+            // is the only EOF that should be allowed to trigger next-episode
+            // handling; a MediaElement segment EOF never reaches this branch.
+            _mediaIsLive = false;
+            _mediaShouldPlay = false;
+            _mediaPlaying = false;
+            _mediaOpened = false;
+            _mediaPlaybackTimer.Stop();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_ended",
+                ("generation", generation), ("live", false),
+                ("position", endedPosition.ToString("F3")),
+                ("source", AppLog.MediaSource(_mediaSource)),
+                ("reason", "hls_bridge_eof")));
+            QueueMediaCastCompletion(naturalEnd: true);
+            return;
+        }
+        RememberImplicitMediaProgress(endedPosition);
+        _mediaOpeningTimer.Stop();
+        _mediaOpened = false;
+        // Keep a playing heartbeat across a segmented HLS hand-off. Reporting
+        // rate=0 during the short reload gap makes some senders interpret a
+        // segment boundary as the end of the programme and issue Next.
+        _mediaPlaying = _mediaIsLive && _mediaShouldPlay;
+        _mediaBuffering = false;
+        _mediaWaitingForFirstFrame = false;
+        ClearMediaCastPendingSeek();
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_ended",
+            ("generation", generation), ("live", _mediaIsLive),
+            ("position", endedPosition.ToString("F3")),
+            ("source", AppLog.MediaSource(_mediaSource))));
+        if (_mediaIsLive || _mediaUsesHlsBridge)
+        {
+            ShowMediaCastStatus("MediaCastLoadingVideo");
+            UpdateMediaCastStatistics(mediaElement);
+            UpdateMediaCastControls(mediaElement);
+            ReportMediaCastPlayback();
+            QueueLiveMediaRecovery("stream ended at the current live edge");
+            return;
+        }
+        _mediaShouldPlay = false;
+        _mediaPlaybackTimer.Stop();
+        MediaCastStatusPanel.Visibility = Visibility.Collapsed;
+        _viewModel.AddUiLog(LocalizationService.Get("MediaCastPlaybackEnded"));
+        UpdateMediaCastStatistics(mediaElement);
+        UpdateMediaCastControls(mediaElement);
+        ReportMediaCastPlayback();
+        QueueMediaCastCompletion(naturalEnd: true);
+    }
+
+    private async Task CheckMediaCastBridgeEndAsync(MediaElement mediaElement,
+        long generation, HlsMediaPlaybackBridge bridge, double endedPosition,
+        int revision, CancellationToken cancellationToken)
+    {
+        // WMF can deliver its only EOF callback before FFmpeg publishes its
+        // exit code. Recheck that callback rather than losing completion in
+        // the narrow interval where the bridge still appears to be running.
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            try { await Task.Delay(250, cancellationToken); }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            { return; }
+            if (!IsCurrentMediaCastEvent(mediaElement, generation) ||
+                revision != _mediaBridgeEndCheckRevision ||
+                !ReferenceEquals(bridge, _mediaHlsBridge) || !_mediaShouldPlay) return;
+            if (ReadMediaCastPosition(mediaElement) > endedPosition + 0.02)
+                return;
+            if (!bridge.IsRunning)
+            {
+                OnMediaCastMediaEnded(mediaElement, generation);
+                return;
+            }
+        }
+        // Playing an ended element did not resume consumption. Its HTTP body
+        // cannot be rebound safely; rebuild from the last observed position.
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_bridge_eof_stalled",
+            ("generation", generation), ("position", _mediaStartPosition)));
+        DisposeHlsMediaBridge();
+        _mediaPlaybackSource = null;
+        QueueLiveMediaRecovery("player ended while the HLS bridge was still running");
+    }
+
+    private void OnMediaCastMediaFailed(
+        object? sender, ExceptionRoutedEventArgs e, long generation)
+    {
+        if (sender is not MediaElement mediaElement ||
+            !IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        try
+        {
+            CompleteMediaCastMediaFailed(mediaElement, e, generation);
+        }
+        catch (Exception error)
+        {
+            RecoverOrStopAfterMediaEventFailure(
+                "failed", error, mediaElement, generation);
+        }
+    }
+
+    private void CompleteMediaCastMediaFailed(MediaElement mediaElement,
+        ExceptionRoutedEventArgs e, long generation)
+    {
+        if (!IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        AdvanceImplicitMediaProgress(mediaElement);
+        var failedPosition = ReadMediaCastPosition(mediaElement);
+        if (!_mediaIsLive)
+            SetMediaCastTimelinePosition(Math.Max(_mediaObservedPosition,
+                Math.Max(_mediaStartPosition, ClampMediaPosition(failedPosition))), running: false);
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_backend_failed",
+            ("generation", generation), ("opened", _mediaOpened),
+            ("position", failedPosition.ToString("F3")),
+            ("hresult", e.ErrorException?.HResult.ToString("X8") ?? "unknown"),
+            ("error", AppLog.Error(SanitizeMediaError(e.ErrorException?.Message ?? "unknown")))));
+        if (_mediaSpeedFallbackPending && _mediaPlaybackSpeed != 1.0)
+        {
+            // WMF rejects SpeedRatio changes on some HLS MPEG-TS samples with
+            // 0x8898050C. Do not leave the recovery loop at the requested rate;
+            // rebuild once at the stable native rate instead.
+            var requestedSpeed = _mediaPlaybackSpeed;
+            _mediaSpeedFallbackPending = false;
+            SetMediaCastTimelineRunning(_mediaTimelineRunning);
+            _mediaPlaybackSpeed = 1.0;
+            MediaCastSpeedComboBox.SelectedIndex = 2;
+            NotifyMediaCastSpeedFallback(requestedSpeed);
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "media_speed_fallback",
+                ("position", failedPosition.ToString("F3")),
+                ("error", e.ErrorException?.HResult.ToString("X8") ?? "unknown")));
+        }
+        if (_mediaHlsBridge is { IsRunning: false, ExitedSuccessfully: true })
+        {
+            _mediaIsLive = false;
+            _mediaShouldPlay = false;
+            _mediaPlaying = false;
+            _mediaOpened = false;
+            _mediaPlaybackTimer.Stop();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_failed_as_eof",
+                ("generation", generation),
+                ("position", failedPosition.ToString("F3")),
+                ("reason", "hls_bridge_eof")));
+            QueueMediaCastCompletion(naturalEnd: true);
+            return;
+        }
+        RememberImplicitMediaProgress(failedPosition);
+        _mediaOpeningTimer.Stop();
+        _mediaOpened = false;
+        _mediaPlaying = (_mediaIsLive || _mediaUsesHlsBridge) && _mediaShouldPlay;
+        _mediaBuffering = false;
+        _mediaWaitingForFirstFrame = false;
+        ClearMediaCastPendingSeek();
+        var message = SanitizeMediaError(
+            e.ErrorException?.Message ?? LocalizationService.Get("UnknownError"));
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_failed",
+            ("generation", generation), ("live", _mediaIsLive),
+            ("source", AppLog.MediaSource(_mediaSource)),
+            ("error", AppLog.Error(message,
+                e.ErrorException?.GetType().Name))));
+        if (_mediaIsLive || _mediaUsesHlsBridge)
+        {
+            ShowMediaCastStatus("MediaCastLoadingVideo");
+            _viewModel.AddUiLog(LocalizationService.Format(
+                "MediaCastLiveRecoveringFormat", message));
+            UpdateMediaCastStatistics(mediaElement);
+            UpdateMediaCastControls(mediaElement);
+            ReportMediaCastPlayback();
+            QueueLiveMediaRecovery(message);
+            return;
+        }
+        _viewModel.AddUiLog(LocalizationService.Format("MediaCastPlaybackFailedFormat",
+            message));
+        UpdateMediaCastStatistics(mediaElement);
+        FinishMediaCastItem(completed: false, message);
+    }
+
+    private MediaCastPlaybackStatus ReadMediaCastPlaybackStatus() =>
+        MediaCastPlaybackControls.GetPlaybackStatus(_mediaCastActive,
+            _mediaStopped, _mediaShouldPlay,
+            IsMediaCastTimelineLoading() || _mediaSeekLoading ||
+                _mediaPendingHlsSeekPosition.HasValue || _mediaPendingSeekPosition.HasValue,
+            _mediaTerminalStatus);
+
+    private void ReportMediaCastPlayback()
+    {
+        if (!_mediaCastActive) return;
+        try
+        {
+            UpdateMediaCastControls();
+            if (_mediaCommandId == 0) return;
+            // A HLS bridge starts life in the live/recovery state, but the
+            // Play command may already carry the complete programme duration.
+            // Preserve that duration while the bridge is opening so the phone
+            // keeps a VOD timeline instead of briefly treating it as live.
+            var duration = _mediaProgramDuration > 0
+                ? _mediaProgramDuration
+                : _mediaIsLive ? 0 : ReadMediaCastDuration(
+                    MediaCastMediaElement);
+            var pendingHlsSeek = ReadMediaCastPendingHlsSeekPosition();
+            var position = pendingHlsSeek ??
+                (IsMediaCastTimelineLoading()
+                    ? ReadMediaCastLoadingPosition()
+                    : _mediaOpened
+                        ? ReadMediaCastControlPosition(MediaCastMediaElement)
+                        : Math.Max(0, _mediaStartPosition));
+            // A remote HLS seek is still loading even after MediaOpened has
+            // fired. Keep the controller at the requested target until the
+            // first stable frame, then resume its normal playing heartbeat.
+            // Report the programme clock's actual state. During a bridge
+            // replacement the position is intentionally frozen; claiming a
+            // non-zero rate here makes the phone add wall-clock time between
+            // reports and then snap backwards on the next update.
+            var status = ReadMediaCastPlaybackStatus();
+            var rate = status == MediaCastPlaybackStatus.Playing &&
+                _mediaTimelineRunning ? _mediaPlaybackSpeed : 0;
+            _viewModel.ReportMediaCastPlayback(_mediaCommandId, duration,
+                position,
+                rate, status);
+            _lastPlaybackReportError = null;
+            UpdateMediaCastStatistics();
+        }
+        catch (Exception error)
+        {
+            // WMF can briefly reject Position/NaturalDuration while changing
+            // source or recovering a live manifest. IPC can also disappear
+            // during receiver shutdown. Neither condition may take down the UI.
+            var failure = AppLog.Error(error);
+            if (!string.Equals(_lastPlaybackReportError, failure, StringComparison.Ordinal))
+            {
+                _lastPlaybackReportError = failure;
+                _viewModel.AddDiagnosticLog(AppLog.Event("media_playback_state_failed",
+                    ("command", _mediaCommandId), ("error", failure)));
+                Debug.WriteLine($"iPhoneMirror playback-state report failed: {failure}");
+            }
+        }
+    }
+
+    private void RecoverOrStopAfterMediaEventFailure(string stage, Exception error,
+        MediaElement mediaElement, long generation)
+    {
+        if (!IsCurrentMediaCastEvent(mediaElement, generation)) return;
+        AdvanceImplicitMediaProgress(mediaElement);
+        var failedPosition = ReadMediaCastPosition(mediaElement);
+        RememberImplicitMediaProgress(failedPosition);
+        _mediaOpened = false;
+        _mediaPlaying = _mediaShouldPlay;
+        var message = SanitizeMediaError(error.Message);
+        try
+        {
+            _viewModel.AddUiLog(LocalizationService.Format(
+                "MediaCastPlaybackFailedFormat", message));
+            _viewModel.AddDiagnosticLog(
+                $"media_event_failed stage={stage} error={message}");
+        }
+        catch (Exception logError)
+        {
+            Debug.WriteLine($"iPhoneMirror media-event failure logging failed: {AppLog.Error(logError)}");
+        }
+
+        if (_mediaCastActive && (_mediaIsLive || _mediaUsesHlsBridge) &&
+            _mediaSource is not null)
+        {
+            try
+            {
+                ShowMediaCastStatus("MediaCastLoadingVideo");
+                QueueLiveMediaRecovery(message);
+                return;
+            }
+            catch (Exception recoveryError)
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("media_recovery_schedule_failed",
+                    ("stage", stage), ("error", AppLog.Error(recoveryError))));
+                Debug.WriteLine($"iPhoneMirror live recovery scheduling failed: {AppLog.Error(recoveryError)}");
+            }
+        }
+        StopMediaCastPlayback("media_event_failed");
+    }
+
+    private double ClampMediaPosition(double position, bool clampToDuration = true,
+        double duration = 0)
+    {
+        var knownDuration = NormalizeMediaDuration(duration);
+        if (knownDuration <= 0) knownDuration = _mediaProgramDuration;
+        if (knownDuration <= 0 && clampToDuration && !_mediaIsLive &&
+            MediaCastMediaElement.NaturalDuration.HasTimeSpan)
+            knownDuration = MediaCastMediaElement.NaturalDuration.TimeSpan.TotalSeconds;
+        return MediaCastPlaybackControls.ClampPosition(position,
+            clampToDuration ? knownDuration : 0);
+    }
+
+    private static double NormalizeMediaDuration(double duration) =>
+        double.IsFinite(duration) && duration > 0 &&
+        duration <= TimeSpan.FromDays(7).TotalSeconds ? duration : 0;
+
+    private void QueueHlsProgramDuration(long generation, Uri source,
+        double duration)
+    {
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        {
+            if (!_mediaCastActive || !_mediaUsesHlsBridge ||
+                _mediaTerminalStatus != MediaCastPlaybackStatus.Unknown ||
+                generation != _mediaCastEvents.CurrentGeneration ||
+                !Equals(source, _mediaSource) ||
+                // FFmpeg reports the playlist duration, not WMF's short
+                // segment window. Six-second ads are valid finite programmes.
+                NormalizeMediaDuration(duration) <= 0) return;
+            if (Math.Abs(_mediaProgramDuration - duration) < 0.05) return;
+            _mediaProgramDuration = duration;
+            _mediaIsLive = false;
+            _mediaStartPosition = MediaCastPlaybackControls.ClampPosition(
+                _mediaStartPosition, duration);
+            UpdateMediaCastControls();
+            ReportMediaCastPlayback();
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "media_hls_duration_discovered",
+                ("generation", generation),
+                ("duration", duration.ToString("F3")),
+                ("position", _mediaStartPosition.ToString("F3"))));
+        });
+    }
+
+    private void SeekMediaCastToPosition(double target, bool allowCoalesce = true)
+    {
+        if (!_mediaCastActive) return;
+        // A seek explicitly starts a new playback attempt for a finished item.
+        var restartingItem = _mediaTerminalStatus != MediaCastPlaybackStatus.Unknown;
+        if (restartingItem)
+        {
+            ResetMediaRecoveryCancellation();
+            _mediaRecoveryBackoff.Reset();
+            _mediaPrematureEndRetried = false;
+        }
+        _mediaTerminalStatus = MediaCastPlaybackStatus.Unknown;
+        target = ClampMediaPosition(target, clampToDuration: true);
+        if (_mediaHlsBridge is not null)
+        {
+            var current = ReadMediaCastTimelinePosition();
+            if (allowCoalesce && Math.Abs(target - current) <= 8)
+            {
+                ClearMediaCastPendingHlsSeek();
+                _mediaSeekLoading = false;
+                _mediaStartPosition = Math.Max(current, target);
+                SetMediaCastTimelinePosition(_mediaStartPosition,
+                    running: _mediaTimelineRunning);
+                _mediaProgressSampleUtc = DateTime.UtcNow;
+                UpdateMediaCastControls();
+                ReportMediaCastPlayback();
+                _viewModel.AddDiagnosticLog(AppLog.Event(
+                    "media_hls_seek_coalesced",
+                    ("target", target.ToString("F3")),
+                    ("current", current.ToString("F3"))));
+                return;
+            }
+        }
+        // A user seek supersedes an already queued delayed reconnect for the
+        // old position, even before the replacement fires MediaOpened.
+        ++_mediaRecoveryRevision;
+        _mediaObservedPosition = target;
+        _mediaPositionRegressionSinceUtc = default;
+        _mediaStartPosition = target;
+        SetMediaCastTimelinePosition(target, running: false);
+        _mediaProgressSampleUtc = DateTime.UtcNow;
+        ClearMediaCastPendingHlsSeek();
+
+        if (_mediaHlsBridge is null && !_mediaUsesHlsBridge)
+        {
+            if (!_mediaOpened)
+            {
+                if (restartingItem) RestartNativeMediaCastAtPosition(target);
+                return;
+            }
+            _mediaSeekLoading = true;
+            try
+            {
+                MediaCastMediaElement.Position = TimeSpan.FromSeconds(target);
+                RestartMediaCastAudioAtCurrentPosition();
+                BeginMediaCastPendingSeek(target);
+                UpdateMediaCastControls();
+                ReportMediaCastPlayback();
+                _viewModel.AddDiagnosticLog(AppLog.Event("media_local_seek",
+                    ("target", target.ToString("F3")),
+                    ("duration", ReadMediaCastDuration(MediaCastMediaElement)
+                        .ToString("F3"))));
+            }
+            catch (InvalidOperationException error)
+            {
+                _mediaSeekLoading = false;
+                _viewModel.AddDiagnosticLog(AppLog.Event("media_local_seek_failed",
+                    ("target", target.ToString("F3")),
+                    ("error", AppLog.Error(SanitizeMediaError(error.Message)))));
+            }
+            return;
+        }
+
+        var source = _mediaSource;
+        if (source is null) return;
+        var generation = _mediaCastEvents.CurrentGeneration;
+        var audioEnabled = !MediaCastMediaElement.IsMuted;
+        var volume = MediaCastMediaElement.Volume;
+        try
+        {
+            _mediaPendingHlsSeekPosition = target;
+            _mediaPendingHlsSeekStartedUtc = DateTime.UtcNow;
+            _mediaSeekLoading = true;
+            _mediaCastAudioDecoder.Stop();
+            DisposeHlsMediaBridge();
+            _mediaBridgeOffset = target;
+            _mediaPlaybackSource = source;
+            _mediaHlsBridge = HlsMediaPlaybackBridge.TryStart(source, target,
+                message => _viewModel.AddDiagnosticLog(AppLog.Event("hls_bridge",
+                    ("message", AppLog.Error(message)))),
+                duration => QueueHlsProgramDuration(
+                    generation, source, duration));
+            if (_mediaHlsBridge is null)
+                throw new InvalidOperationException(LocalizationService.Get("HlsRestartFailed"));
+            _mediaPlaybackSource = _mediaHlsBridge.PlaybackUri;
+            _mediaOpened = false;
+            _mediaBuffering = false;
+            _mediaWaitingForFirstFrame = _mediaShouldPlay;
+            _mediaOpeningPosition = target;
+            _mediaOpenedAtUtc = DateTime.UtcNow;
+            _mediaProgressSampleUtc = _mediaOpenedAtUtc;
+            ClearMediaCastPendingSeek();
+            ShowMediaCastStatus("MediaCastLoadingVideo");
+            _mediaOpeningTimer.Start();
+            if (!ReplaceMediaCastMediaElement(_mediaPlaybackSource, generation,
+                    audioEnabled, volume)) return;
+            if (_mediaHlsBridge is null)
+            {
+                if (_mediaShouldPlay) MediaCastMediaElement.Play();
+                else MediaCastMediaElement.Pause();
+            }
+            _mediaPlaybackTimer.Start();
+            UpdateMediaCastControls();
+            ReportMediaCastPlayback();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_hls_seek_restart",
+                ("target", target.ToString("F3")),
+                ("duration", _mediaProgramDuration.ToString("F3"))));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_hls_seek_restart_failed",
+                ("target", target.ToString("F3")),
+                ("error", AppLog.Error(SanitizeMediaError(error.Message)))));
+            QueueLiveMediaRecovery("HLS seek restart failed");
+        }
+    }
+
+    private void RestartNativeMediaCastAtPosition(double target)
+    {
+        var source = _mediaSource;
+        if (source is null) return;
+        var generation = _mediaCastEvents.CurrentGeneration;
+        var audioEnabled = !MediaCastMediaElement.IsMuted;
+        var volume = MediaCastMediaElement.Volume;
+        try
+        {
+            // A terminal WMF element cannot be assumed open again. Set the
+            // target before binding a fresh renderer; MediaOpened applies it
+            // while preserving whether this was a paused seek or a replay.
+            _mediaCastAudioDecoder.Stop();
+            _mediaPlaybackSource = ResolveNativeMediaCastSource(source);
+            _mediaPlaying = false;
+            _mediaBuffering = false;
+            _mediaSeekLoading = target > 0;
+            _mediaWaitingForFirstFrame = _mediaShouldPlay;
+            _mediaOpeningPosition = target;
+            _mediaOpenedAtUtc = DateTime.UtcNow;
+            _mediaProgressSampleUtc = _mediaOpenedAtUtc;
+            ClearMediaCastPendingSeek();
+            ShowMediaCastStatus("MediaCastLoadingVideo");
+            _mediaOpeningTimer.Start();
+            if (!ReplaceMediaCastMediaElement(_mediaPlaybackSource, generation,
+                    audioEnabled, volume)) return;
+            if (_mediaShouldPlay) MediaCastMediaElement.Play();
+            else MediaCastMediaElement.Pause();
+            _mediaPlaybackTimer.Start();
+            UpdateMediaCastControls();
+            ReportMediaCastPlayback();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_native_seek_restart",
+                ("target", target.ToString("F3")),
+                ("duration", _mediaProgramDuration.ToString("F3"))));
+        }
+        catch (Exception error)
+        {
+            var message = SanitizeMediaError(error.Message);
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_native_seek_restart_failed",
+                ("target", target.ToString("F3")),
+                ("error", AppLog.Error(message))));
+            FinishMediaCastItem(completed: false, message);
+        }
+    }
+
+    private void UpdateMediaCastStatistics(MediaElement? mediaElement = null)
+    {
+        mediaElement ??= MediaCastMediaElement;
+        _viewModel.UpdateMediaCastStatistics(
+            (uint)Math.Max(0, mediaElement.NaturalVideoWidth),
+            (uint)Math.Max(0, mediaElement.NaturalVideoHeight),
+            !mediaElement.IsMuted && mediaElement.Volume > 0);
+    }
+
+    private void OnMediaPlaybackTimerTick(object? sender, EventArgs e)
+    {
+        if (_mediaCastActive && _mediaOpened && _mediaUsesHlsBridge &&
+            _mediaTerminalStatus == MediaCastPlaybackStatus.Unknown)
+        {
+            var actual = ReadMediaCastPosition(MediaCastMediaElement);
+            var now = DateTime.UtcNow;
+            if (actual > _mediaLastActualPosition + 0.02 || !_mediaShouldPlay ||
+                _mediaSeekLoading || _mediaWaitingForFirstFrame)
+            {
+                _mediaLastActualPosition = actual;
+                _mediaLastActualAdvanceUtc = now;
+                _mediaPositionRegressionSinceUtc = default;
+            }
+            var canRecover = _mediaShouldPlay && !_mediaSeekLoading &&
+                !_mediaWaitingForFirstFrame && !_mediaPendingHlsSeekPosition.HasValue &&
+                !_mediaPendingSeekPosition.HasValue;
+            var observed = Math.Max(_mediaObservedPosition, _mediaLastActualPosition);
+            if (canRecover && !_mediaIsLive && observed - actual > 2 &&
+                MediaCastPlaybackControls.IsPrematureEnd(_mediaProgramDuration, observed))
+            {
+                if (_mediaPositionRegressionSinceUtc == default)
+                    _mediaPositionRegressionSinceUtc = now;
+                if (now - _mediaPositionRegressionSinceUtc >= TimeSpan.FromSeconds(1))
+                {
+                    RecoverStalledMediaCastPlayback("player timestamp moved backwards", actual, observed);
+                    return;
+                }
+            }
+            else
+                _mediaPositionRegressionSinceUtc = default;
+            if (_mediaShouldPlay) _mediaRecoveryBackoff.MarkProgress(actual);
+            // WMF can stop consuming without delivering another EOF, even
+            // while its producer still runs. Only stationary playback is
+            // re-evaluated; buffered media which advances keeps playing.
+            if (_mediaHlsBridge is not null && canRecover &&
+                now - _mediaLastActualAdvanceUtc >= TimeSpan.FromSeconds(15))
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("media_bridge_stalled",
+                    ("position", actual), ("eof", _mediaHlsBridge.ExitedSuccessfully)));
+                if (!_mediaHlsBridge.IsRunning)
+                    OnMediaCastMediaEnded(MediaCastMediaElement,
+                        _mediaCastEvents.CurrentGeneration);
+                else
+                    RecoverStalledMediaCastPlayback("player did not advance while the HLS bridge was running",
+                        actual, observed);
+                return;
+            }
+        }
+        if (_mediaSpeedFallbackPending &&
+            DateTime.UtcNow - _mediaSpeedChangedUtc > TimeSpan.FromSeconds(5))
+            _mediaSpeedFallbackPending = false;
+        RetryPendingMediaCastSeek();
+        if (_mediaCastActive && _mediaOpened &&
+            DateTime.UtcNow - _mediaHealthSampleUtc >= TimeSpan.FromSeconds(5))
+        {
+            _mediaHealthSampleUtc = DateTime.UtcNow;
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_playback_health",
+                ("actual", ReadMediaCastPosition(MediaCastMediaElement).ToString("F3")),
+                ("timeline", ReadMediaCastTimelinePosition().ToString("F3")),
+                ("buffering", _mediaBuffering),
+                ("bridge_running", _mediaHlsBridge?.IsRunning),
+                ("bridge_eof", _mediaHlsBridge?.ExitedSuccessfully)));
+        }
+        if (_mediaCastActive && _mediaTimelineRunning &&
+            !_mediaSeekInteraction && !_mediaSeekLoading)
+        {
+            // Keep the recovery origin on the same programme clock used by
+            // both scrubbers. A later bridge reconnect must resume near the
+            // visible position rather than the last explicit seek target.
+            _mediaStartPosition = ReadMediaCastTimelinePosition();
+        }
+        if (_mediaIsLive && _mediaOpened)
+        {
+            // Keep the last known programme position across HLS segment
+            // reloads. WMF may expose a newly-created element at position 0
+            // before MediaOpened, so never let that transient value move the
+            // sender's progress backwards.
+            var current = ReadMediaCastPosition(MediaCastMediaElement);
+            if (_mediaPendingSeekPosition is null)
+            {
+                if (_mediaPlaying && _mediaProgressSampleUtc != default)
+                {
+                    var elapsed = DateTime.UtcNow - _mediaProgressSampleUtc;
+                    if (elapsed > TimeSpan.Zero && elapsed < TimeSpan.FromSeconds(15))
+                        current = Math.Max(current,
+                            _mediaStartPosition + elapsed.TotalSeconds);
+                }
+                RememberImplicitMediaProgress(current);
+                _mediaProgressSampleUtc = DateTime.UtcNow;
+            }
+        }
+        ReportMediaCastPlayback();
+    }
+
+    private void RecoverStalledMediaCastPlayback(string reason, double actual, double observed)
+    {
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_progress_recovery",
+            ("reason", reason), ("actual", actual), ("observed", observed)));
+        // A producer can stay alive while WMF loses its time base or stops
+        // consuming bytes. Freeze at observed media progress before marking
+        // the player closed; recovery must not synthesize or skip programme time.
+        SetMediaCastTimelinePosition(observed, running: false);
+        _mediaOpened = false;
+        _mediaBuffering = false;
+        _mediaWaitingForFirstFrame = true;
+        _mediaCastEvents.TryUnbind(_mediaCastEvents.CurrentGeneration,
+            MediaCastMediaElement);
+        DisposeHlsMediaBridge();
+        _mediaPlaybackSource = null;
+        ShowMediaCastStatus("MediaCastLoadingVideo");
+        QueueLiveMediaRecovery(reason);
+    }
+
+    private void OnMediaOpeningTimerTick(object? sender, EventArgs e)
+    {
+        if (!_mediaCastActive || _mediaOpened || _mediaSource is null) {
+            _mediaOpeningTimer.Stop();
+            return;
+        }
+        var bridge = _mediaHlsBridge;
+        if (bridge is not null)
+        {
+            // Both HLS inputs and WMF share the bridge's progress budget.
+            // A healthy second input may still be probing after the original
+            // fixed 20s window; repeated errors cannot renew this budget.
+            if (!bridge.HasStartupTimedOut) return;
+        }
+        else if (DateTime.UtcNow - _mediaOpenedAtUtc < TimeSpan.FromSeconds(20))
+            return;
+        _mediaOpeningTimer.Stop();
+        var generation = _mediaCastEvents.CurrentGeneration;
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_open_timeout",
+            ("generation", generation),
+            ("source", AppLog.MediaSource(_mediaSource)),
+            ("stage", bridge?.StartupStage ?? "native_open")));
+        var message = bridge is not null
+            ? "media source startup timed out"
+            : "media source did not open within 20 seconds";
+        _viewModel.AddUiLog(LocalizationService.Format(
+            "MediaCastPlaybackFailedFormat", message));
+        if (_mediaIsLive || _mediaUsesHlsBridge)
+        {
+            // A live bridge can remain alive while its input playlist/request
+            // is stuck (for example when a provider rejects the first HTTP
+            // request). Reusing that process only rebinds MediaElement to the
+            // same dead listener and leaves the UI in Loading forever.
+            DisposeHlsMediaBridge();
+            _mediaPlaybackSource = null;
+            QueueLiveMediaRecovery(message);
+            return;
+        }
+        StopMediaCastPlayback("media_open_timeout");
+    }
+
+    private void ShowMediaCastStatus(string resourceKey)
+    {
+        MediaCastStatusText.Text = LocalizationService.Get(resourceKey);
+        MediaCastStatusPanel.Visibility = Visibility.Visible;
+    }
+
+    private void ResetMediaCastTimelineClock()
+    {
+        _mediaTimelineAnchorPosition = 0;
+        _mediaTimelineAnchorUtc = default;
+        _mediaTimelineRunning = false;
+    }
+
+    private double ReadMediaCastTimelinePosition()
+    {
+        // WPF buffering notifications can lag behind the stalled player.
+        // Read its programme position; retain the anchor during seek/load.
+        if (MediaCastPlaybackControls.UsePlayerTimeline(_mediaUsesHlsBridge,
+                _mediaOpened, _mediaIsLive, _mediaWaitingForFirstFrame,
+                _mediaSeekLoading || _mediaPendingHlsSeekPosition.HasValue ||
+                _mediaPendingSeekPosition.HasValue))
+            return ClampMediaPosition(Math.Max(_mediaObservedPosition,
+                ReadMediaCastPosition(MediaCastMediaElement)));
+        var position = _mediaTimelineAnchorPosition;
+        if (_mediaTimelineRunning && _mediaTimelineAnchorUtc != default)
+        {
+            var elapsed = DateTime.UtcNow - _mediaTimelineAnchorUtc;
+            if (elapsed > TimeSpan.Zero && elapsed < TimeSpan.FromDays(1))
+                position += elapsed.TotalSeconds * _mediaPlaybackSpeed;
+        }
+        return ClampMediaPosition(position, clampToDuration: true);
+    }
+
+    private void SetMediaCastTimelinePosition(double position, bool running)
+    {
+        _mediaTimelineAnchorPosition = ClampMediaPosition(position,
+            clampToDuration: true);
+        _mediaTimelineAnchorUtc = DateTime.UtcNow;
+        _mediaTimelineRunning = running;
+        _mediaStartPosition = _mediaTimelineAnchorPosition;
+        _mediaLastTimelinePosition = _mediaTimelineAnchorPosition;
+    }
+
+    private void SetMediaCastTimelineRunning(bool running)
+    {
+        var position = ReadMediaCastTimelinePosition();
+        _mediaTimelineAnchorPosition = position;
+        _mediaTimelineAnchorUtc = DateTime.UtcNow;
+        _mediaTimelineRunning = running;
+        _mediaStartPosition = position;
+        _mediaLastTimelinePosition = position;
+    }
+
+    private void SynchronizeMediaCastTimelineClock()
+    {
+        var shouldRun = _mediaCastActive && _mediaShouldPlay && _mediaOpened &&
+            !_mediaBuffering && !_mediaWaitingForFirstFrame &&
+            !_mediaPendingHlsSeekPosition.HasValue;
+        SetMediaCastTimelineRunning(shouldRun);
+    }
+
+    private double ReadMediaCastPosition(MediaElement mediaElement)
+    {
+        try
+        {
+            var position = mediaElement.Position.TotalSeconds;
+            if (!double.IsFinite(position)) return 0;
+            position = Math.Max(0, position);
+            if (_mediaHlsBridge is not null)
+                position += _mediaBridgeOffset;
+            // WMF can return the bogus natural-duration endpoint for an HLS
+            // element while a playlist is being opened or replaced. Expose
+            // the last accepted position instead of advertising programme
+            // completion to the sender.
+            if (_mediaIsLive && position - _mediaStartPosition > 45)
+            {
+                if (Math.Abs(position - _lastRejectedMediaPosition) > 0.5)
+                {
+                    _lastRejectedMediaPosition = position;
+                    _viewModel.AddDiagnosticLog(AppLog.Event(
+                        "media_position_jump_ignored",
+                        ("position", position.ToString("F3")),
+                        ("saved_position", _mediaStartPosition.ToString("F3"))));
+                }
+                return Math.Max(0, _mediaStartPosition);
+            }
+            if (_mediaOpened && !_mediaWaitingForFirstFrame && !_mediaSeekLoading &&
+                !_mediaPendingHlsSeekPosition.HasValue && !_mediaPendingSeekPosition.HasValue)
+                _mediaObservedPosition = Math.Max(_mediaObservedPosition,
+                    ClampMediaPosition(position));
+            return position;
+        }
+        catch (InvalidOperationException)
+        {
+            return Math.Max(0, _mediaStartPosition);
+        }
+    }
+
+    private void AdvanceImplicitMediaProgress(MediaElement mediaElement)
+    {
+        if (!_mediaIsLive || !_mediaOpened || !_mediaShouldPlay) return;
+        var current = ReadMediaCastPosition(mediaElement);
+        if (_mediaProgressSampleUtc != default)
+        {
+            var elapsed = DateTime.UtcNow - _mediaProgressSampleUtc;
+            if (elapsed > TimeSpan.Zero && elapsed < TimeSpan.FromSeconds(15))
+                current = Math.Max(current, _mediaStartPosition + elapsed.TotalSeconds);
+        }
+        RememberImplicitMediaProgress(current);
+        _mediaProgressSampleUtc = DateTime.UtcNow;
+    }
+
+    private bool RememberImplicitMediaProgress(double candidate)
+    {
+        if (!_mediaIsLive || !double.IsFinite(candidate) ||
+            candidate <= _mediaStartPosition) return false;
+
+        // A live HLS element normally advances by a few seconds between UI
+        // ticks. WMF occasionally returns the playlist's bogus end position
+        // (tens of thousands of seconds) while a segment is being reopened;
+        // never turn that transient value into the next recovery seek target.
+        const double maximumImplicitAdvanceSeconds = 45;
+        if (candidate - _mediaStartPosition > maximumImplicitAdvanceSeconds)
+        {
+            if (Math.Abs(candidate - _lastRejectedMediaPosition) > 0.5)
+            {
+                _lastRejectedMediaPosition = candidate;
+                _viewModel.AddDiagnosticLog(AppLog.Event(
+                    "media_position_jump_ignored",
+                    ("position", candidate.ToString("F3")),
+                    ("saved_position", _mediaStartPosition.ToString("F3"))));
+            }
+            return false;
+        }
+
+        _lastRejectedMediaPosition = 0;
+        _mediaStartPosition = candidate;
+        return true;
+    }
+
+    private void BeginMediaCastPendingSeek(double target)
+    {
+        var now = DateTime.UtcNow;
+        _mediaPendingSeekPosition = target;
+        _mediaPendingSeekStartedUtc = now;
+        _mediaPendingSeekLastAttemptUtc = now;
+        _mediaPendingSeekAttemptCount = 1;
+    }
+
+    private void ClearMediaCastPendingHlsSeek()
+    {
+        _mediaPendingHlsSeekPosition = null;
+        _mediaPendingHlsSeekStartedUtc = default;
+    }
+
+    private double? ReadMediaCastPendingHlsSeekPosition()
+    {
+        if (_mediaPendingHlsSeekPosition is not { } target) return null;
+        if (!_mediaOpened) return target;
+
+        var elapsed = DateTime.UtcNow - _mediaPendingHlsSeekStartedUtc;
+        var actual = ReadMediaCastPosition(MediaCastMediaElement);
+        // Do not release the target while the replacement is still buffering
+        // or waiting for its first frame. The local element can briefly report
+        // the segment origin at this point, which would make both sliders jump
+        // back before playback is ready.
+        if (Math.Abs(actual - target) <= 2 &&
+            !_mediaBuffering && !_mediaWaitingForFirstFrame)
+        {
+            ClearMediaCastPendingHlsSeek();
+            _mediaSeekLoading = false;
+            SynchronizeMediaCastTimelineClock();
+            return null;
+        }
+        if (elapsed < TimeSpan.FromSeconds(20)) return target;
+
+        ClearMediaCastPendingHlsSeek();
+        _mediaSeekLoading = false;
+        SynchronizeMediaCastTimelineClock();
+        return null;
+    }
+
+    private bool IsMediaCastTimelineLoading(double? pendingHlsSeek = null) =>
+        !_mediaOpened || _mediaBuffering || _mediaWaitingForFirstFrame ||
+        pendingHlsSeek.HasValue;
+
+    private double ReadMediaCastLoadingPosition()
+    {
+        return ReadMediaCastTimelinePosition();
+    }
+
+    private void ClearMediaCastPendingSeek()
+    {
+        _mediaPendingSeekPosition = null;
+        _mediaPendingSeekStartedUtc = default;
+        _mediaPendingSeekLastAttemptUtc = default;
+        _mediaPendingSeekAttemptCount = 0;
+    }
+
+    private void RetryPendingMediaCastSeek()
+    {
+        if (!_mediaCastActive || !_mediaOpened || _mediaSeekInteraction ||
+            _mediaPendingSeekPosition is not { } target) return;
+
+        var now = DateTime.UtcNow;
+        var actual = ReadMediaCastPosition(MediaCastMediaElement);
+        if (!MediaCastPlaybackControls.ShouldRetryPendingSeek(
+                actual, target, now - _mediaPendingSeekLastAttemptUtc,
+                _mediaPendingSeekAttemptCount, _mediaBuffering)) return;
+
+        // Count a rejected attempt as well so an unavailable WMF backend can
+        // never cause an unbounded retry loop on the UI thread.
+        _mediaPendingSeekLastAttemptUtc = now;
+        ++_mediaPendingSeekAttemptCount;
+        try
+        {
+            MediaCastMediaElement.Position = TimeSpan.FromSeconds(target);
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_local_seek_retry",
+                ("target", target.ToString("F3")),
+                ("actual", actual.ToString("F3")),
+                ("attempt", _mediaPendingSeekAttemptCount)));
+        }
+        catch (InvalidOperationException error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_local_seek_retry_failed",
+                ("target", target.ToString("F3")),
+                ("attempt", _mediaPendingSeekAttemptCount),
+                ("error", AppLog.Error(SanitizeMediaError(error.Message)))));
+        }
+    }
+
+    private double ReadMediaCastControlPosition(MediaElement mediaElement)
+    {
+        _ = ReadMediaCastPendingHlsSeekPosition();
+        if (_mediaPendingSeekPosition is { } pending)
+        {
+            var actual = ReadMediaCastPosition(mediaElement);
+            if (!MediaCastPlaybackControls.ShouldRetainPendingSeek(actual, pending,
+                    DateTime.UtcNow - _mediaPendingSeekStartedUtc))
+            {
+                ClearMediaCastPendingSeek();
+                _mediaSeekLoading = false;
+                SynchronizeMediaCastTimelineClock();
+            }
+        }
+        return ReadMediaCastTimelinePosition();
+    }
+
+    private double ReadMediaCastDuration(MediaElement mediaElement)
+    {
+        if (_mediaProgramDuration > 0) return _mediaProgramDuration;
+        try
+        {
+            return mediaElement.NaturalDuration.HasTimeSpan
+                ? Math.Max(0, mediaElement.NaturalDuration.TimeSpan.TotalSeconds) : 0;
+        }
+        catch (InvalidOperationException)
+        {
+            return 0;
+        }
+    }
+
+    private void UpdateMediaCastControls(MediaElement? mediaElement = null)
+    {
+        if (_updatingMediaCastControls) return;
+        mediaElement ??= MediaCastMediaElement;
+        var pendingHlsSeek = ReadMediaCastPendingHlsSeekPosition();
+        var timelineLoading = _mediaTerminalStatus == MediaCastPlaybackStatus.Unknown &&
+            (IsMediaCastTimelineLoading(pendingHlsSeek) || _mediaSeekLoading);
+        var actualPosition = _mediaOpened
+            ? ReadMediaCastPosition(mediaElement) : Math.Max(0, _mediaStartPosition);
+        // The slider and controller always use the programme clock. The
+        // MediaElement position is intentionally read only for open/seek
+        // health checks because HLS replacement timestamps are discontinuous.
+        var position = ReadMediaCastTimelinePosition();
+        var naturalDuration = _mediaOpened ? ReadMediaCastDuration(mediaElement) :
+            _mediaProgramDuration;
+        // Keep a known programme duration visible during HLS replacement;
+        // otherwise the slider temporarily collapses to Maximum=1 and Value=0
+        // until FFmpeg reports the same duration again.
+        var duration = _mediaProgramDuration > 0
+            ? _mediaProgramDuration
+            : _mediaIsLive ? 0 : naturalDuration;
+        var canSeek = CanSeekMediaCastTimeline(duration);
+        // During a HLS replacement the MediaElement is intentionally not
+        // seekable yet, but a known programme duration still gives the slider
+        // a stable scale and lets it retain the requested target visually.
+        var hasTimeline = double.IsFinite(duration) && duration > 0;
+        var timelineDuration = hasTimeline ? duration : _mediaLastTimelineDuration;
+        // During either kind of seek hand-off, the requested programme
+        // position is authoritative. WMF may expose the new segment's local
+        // timestamp before its first frame; allowing that value through here
+        // is the source of the visible thumb jump.
+        var pendingProgrammePosition = pendingHlsSeek ??
+            _mediaPendingSeekPosition;
+        var timelinePosition = pendingProgrammePosition is { } requested
+            ? Math.Clamp(requested, 0, timelineDuration > 0
+                ? timelineDuration : duration)
+            : hasTimeline
+                ? Math.Clamp(position, 0, duration)
+                : timelineDuration > 0
+                    ? Math.Clamp(_mediaLastTimelinePosition, 0, timelineDuration)
+                    : 0;
+        if (hasTimeline && !_mediaSeekInteraction && !timelineLoading)
+        {
+            _mediaLastTimelineDuration = duration;
+            _mediaLastTimelinePosition = timelinePosition;
+        }
+
+        if (_mediaWaitingForFirstFrame && _mediaOpened &&
+            MediaCastPlaybackControls.ShouldRevealVideo(_mediaShouldPlay,
+                _mediaBuffering, _mediaOpeningPosition, actualPosition,
+                DateTime.UtcNow - _mediaOpenedAtUtc))
+        {
+            if (pendingProgrammePosition is null &&
+                actualPosition >= _mediaOpeningPosition &&
+                actualPosition - _mediaOpeningPosition <= 30)
+            {
+                SetMediaCastTimelinePosition(actualPosition, running: false);
+            }
+            _mediaWaitingForFirstFrame = false;
+            SynchronizeMediaCastTimelineClock();
+            if (_mediaShouldPlay)
+                StartMediaCastAudioAt(ReadMediaCastTimelinePosition());
+            if (!_mediaBuffering)
+                MediaCastStatusPanel.Visibility = Visibility.Collapsed;
+        }
+
+        _updatingMediaCastControls = true;
+        try
+        {
+            MediaCastControlsPanel.IsEnabled = _mediaCastActive;
+            MediaCastPlayPauseButton.IsEnabled = _mediaCastActive;
+            MediaCastMuteButton.IsEnabled = _mediaCastActive;
+            MediaCastSpeedComboBox.IsEnabled = _mediaCastActive;
+            MediaCastVolumeSlider.IsEnabled = _mediaCastActive;
+            // Keep the Slider itself enabled while the HLS element is being
+            // replaced. Disabling it causes WPF to revoke mouse capture and
+            // can turn a normal drag into a second, stale seek transaction.
+            // Hit testing is the loading lock; the value/maximum remain stable
+            // programme-time coordinates throughout the replacement.
+            var sliderMaximum = timelineDuration > 0 ? timelineDuration : 1;
+            var sliderCanBeUsed = canSeek && !_mediaSeekLoading &&
+                !timelineLoading;
+            MediaCastSeekSlider.IsEnabled = _mediaCastActive &&
+                timelineDuration > 0;
+            // Lock hit testing while loading so Slider's class handler cannot
+            // move the Thumb before our guard runs. Keep it hit-testable for
+            // an already active drag; MouseUp will finish that transaction
+            // and the next sync will apply the loading lock.
+            MediaCastSeekSlider.IsHitTestVisible = sliderCanBeUsed ||
+                _mediaSeekInteraction;
+            MediaCastSeekBackwardButton.IsEnabled = sliderCanBeUsed;
+            MediaCastSeekForwardButton.IsEnabled = sliderCanBeUsed;
+            if (Math.Abs(MediaCastSeekSlider.Maximum - sliderMaximum) > 0.001)
+            {
+                MediaCastSeekSlider.Maximum = sliderMaximum;
+                _viewModel.AddDiagnosticLog(AppLog.Event("maximum_changed",
+                    ("maximum", sliderMaximum.ToString("F3")),
+                    ("value", MediaCastSeekSlider.Value.ToString("F3")),
+                    ("interaction", _mediaSeekInteraction),
+                    ("seek_loading", _mediaSeekLoading),
+                    ("opened", _mediaOpened)));
+            }
+            if (!_mediaSeekInteraction)
+            {
+                var stableValue = Math.Clamp(timelinePosition, 0, sliderMaximum);
+                if (Math.Abs(MediaCastSeekSlider.Value - stableValue) > 0.001)
+                {
+                    MediaCastSeekSlider.Value = stableValue;
+                    // Log only meaningful programmatic moves. Normal 250 ms
+                    // clock ticks are intentionally omitted from diagnostics.
+                    if (_mediaSeekLoading ||
+                        double.IsNaN(_lastSeekSliderSyncPosition) ||
+                        Math.Abs(_lastSeekSliderSyncPosition - stableValue) > 2)
+                    {
+                        _viewModel.AddDiagnosticLog(AppLog.Event("seek_slider_sync",
+                            ("value", stableValue.ToString("F3")),
+                            ("target", _mediaSeekInteractionTarget.ToString("F3")),
+                            ("maximum", sliderMaximum.ToString("F3")),
+                            ("interaction", _mediaSeekInteraction),
+                            ("seek_loading", _mediaSeekLoading),
+                            ("pending_hls", _mediaPendingHlsSeekPosition.HasValue),
+                            ("opened", _mediaOpened),
+                            ("buffering", _mediaBuffering)));
+                    }
+                    _lastSeekSliderSyncPosition = stableValue;
+                }
+            }
+
+            var displayPosition = _mediaSeekInteraction && canSeek
+                ? _mediaSeekInteractionTarget
+                : timelinePosition;
+            MediaCastCurrentTimeText.Text =
+                MediaCastPlaybackControls.FormatTime(displayPosition);
+            MediaCastDurationText.Text = timelineDuration > 0
+                ? MediaCastPlaybackControls.FormatTime(timelineDuration)
+                : _mediaOpened && _mediaIsLive
+                    ? LocalizationService.Get("MediaCastLive") : "--:--";
+
+            SetAnimatedMediaSymbol(MediaCastPlayPauseIcon,
+                _mediaShouldPlay ? SymbolRegular.Pause20 : SymbolRegular.Play20);
+            MediaCastPlayPauseButton.ToolTip = LocalizationService.Get(
+                _mediaShouldPlay ? "MediaCastPause" : "MediaCastPlay");
+
+            var muted = mediaElement.IsMuted || mediaElement.Volume <= 0;
+            SetAnimatedMediaSymbol(MediaCastVolumeIcon,
+                muted ? SymbolRegular.SpeakerMute20 : SymbolRegular.Speaker220);
+            MediaCastMuteButton.ToolTip = LocalizationService.Get(
+                muted ? "MediaCastUnmute" : "MediaCastMute");
+            var speedIndex = GetMediaCastSpeedIndex(_mediaPlaybackSpeed);
+            if (MediaCastSpeedComboBox.SelectedIndex != speedIndex)
+                MediaCastSpeedComboBox.SelectedIndex = speedIndex;
+            MediaCastVolumeSlider.Value = Math.Clamp(mediaElement.Volume * 100, 0, 100);
+        }
+        finally
+        {
+            _updatingMediaCastControls = false;
+        }
+
+        if (!_mediaShouldPlay || _mediaBuffering || _mediaWaitingForFirstFrame)
+            RevealMediaCastControls(scheduleAutoHide: false);
+        else if (_mediaControlsVisible && !_mediaControlsHideTimer.IsEnabled)
+            ScheduleMediaCastControlsAutoHide();
+    }
+
+    private static void SetAnimatedMediaSymbol(SymbolIcon icon, SymbolRegular symbol)
+    {
+        if (icon.Symbol == symbol) return;
+        icon.Symbol = symbol;
+        if (!SystemParameters.ClientAreaAnimation) return;
+        icon.BeginAnimation(OpacityProperty, new DoubleAnimation(0.42, 1,
+            TimeSpan.FromMilliseconds(120))
+        {
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+        }, HandoffBehavior.SnapshotAndReplace);
+    }
+
+    private void OnMediaControlsHideTimerTick(object? sender, EventArgs e)
+    {
+        _mediaControlsHideTimer.Stop();
+        if (!_mediaCastActive || !_mediaShouldPlay || _mediaBuffering ||
+            _mediaWaitingForFirstFrame || _mediaSeekInteraction ||
+            MediaCastControlsPanel.IsMouseOver || MediaCastControlsPanel.IsKeyboardFocusWithin)
+        {
+            if (_mediaCastActive && _mediaShouldPlay)
+                _mediaControlsHideTimer.Start();
+            return;
+        }
+        SetMediaCastControlsVisible(false, animate: true);
+    }
+
+    private void RevealMediaCastControls(bool scheduleAutoHide = true)
+    {
+        SetMediaCastControlsVisible(true, animate: true);
+        if (scheduleAutoHide) ScheduleMediaCastControlsAutoHide();
+        else _mediaControlsHideTimer.Stop();
+    }
+
+    private void ScheduleMediaCastControlsAutoHide()
+    {
+        _mediaControlsHideTimer.Stop();
+        if (!_mediaCastActive || !_mediaShouldPlay || _mediaBuffering ||
+            _mediaWaitingForFirstFrame || _mediaSeekInteraction) return;
+        _mediaControlsHideTimer.Start();
+    }
+
+    private void SetMediaCastControlsVisible(bool visible, bool animate)
+    {
+        if (_mediaControlsVisible == visible &&
+            Math.Abs(MediaCastControlsPanel.Opacity - (visible ? 1 : 0)) < 0.01)
+            return;
+        _mediaControlsVisible = visible;
+        MediaCastControlsPanel.IsHitTestVisible = visible;
+        var target = visible ? 1d : 0d;
+        if (!animate || !SystemParameters.ClientAreaAnimation)
+        {
+            MediaCastControlsPanel.BeginAnimation(OpacityProperty, null);
+            MediaCastControlsPanel.Opacity = target;
+            return;
+        }
+        MediaCastControlsPanel.BeginAnimation(OpacityProperty,
+            new DoubleAnimation(target, TimeSpan.FromMilliseconds(visible ? 140 : 190))
+            {
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+            }, HandoffBehavior.SnapshotAndReplace);
+    }
+
+    private void OnMediaControlsGotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e) =>
+        RevealMediaCastControls(scheduleAutoHide: false);
+
+    private void OnMediaControlsLostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        if (!MediaCastControlsPanel.IsKeyboardFocusWithin) ScheduleMediaCastControlsAutoHide();
+    }
+
+    private void OnMediaCastPlayerMouseEnter(object sender, MouseEventArgs e) =>
+        RevealMediaCastControls();
+
+    private void OnMediaCastPlayerMouseMove(object sender, MouseEventArgs e) =>
+        RevealMediaCastControls();
+
+    private void OnMediaCastPlayerMouseLeave(object sender, MouseEventArgs e) =>
+        ScheduleMediaCastControlsAutoHide();
+
+    private void OnMediaCastPlayerSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        var width = e.NewSize.Width;
+        var showSkipButtons = width >= 430;
+        var showVolumeSlider = width >= 620;
+        var showPlaybackSpeed = width >= 560;
+        MediaCastSeekBackwardButton.Visibility = showSkipButtons
+            ? Visibility.Visible : Visibility.Collapsed;
+        MediaCastSeekForwardButton.Visibility = showSkipButtons
+            ? Visibility.Visible : Visibility.Collapsed;
+        MediaCastVolumeSlider.Visibility = showVolumeSlider
+            ? Visibility.Visible : Visibility.Collapsed;
+        MediaCastSpeedComboBox.Visibility = showPlaybackSpeed
+            ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void ResetMediaCastControls()
+    {
+        ClearMediaCastPendingSeek();
+        _mediaControlsHideTimer.Stop();
+        SetMediaCastControlsVisible(true, animate: false);
+        _updatingMediaCastControls = true;
+        try
+        {
+            MediaCastStatusPanel.Visibility = Visibility.Collapsed;
+            MediaCastControlsPanel.IsEnabled = false;
+            MediaCastSeekSlider.IsEnabled = false;
+            MediaCastSeekSlider.IsHitTestVisible = false;
+            MediaCastSeekSlider.Maximum = 1;
+            MediaCastSeekSlider.Value = 0;
+            MediaCastSeekBackwardButton.IsEnabled = false;
+            MediaCastSeekForwardButton.IsEnabled = false;
+            MediaCastPlayPauseButton.IsEnabled = false;
+            MediaCastMuteButton.IsEnabled = false;
+            MediaCastSpeedComboBox.IsEnabled = false;
+            MediaCastSpeedComboBox.SelectedIndex = 2;
+            MediaCastVolumeSlider.IsEnabled = false;
+            MediaCastCurrentTimeText.Text = "00:00";
+            MediaCastDurationText.Text = "--:--";
+            MediaCastPlayPauseIcon.Symbol = SymbolRegular.Play20;
+            MediaCastVolumeIcon.Symbol = SymbolRegular.Speaker220;
+            _mediaPlaybackSpeed = 1.0;
+            _mediaSpeedFallbackPending = false;
+            _mediaSpeedFallbackPromptShown = false;
+            MediaCastVolumeSlider.Value = 100;
+        }
+        finally
+        {
+            _updatingMediaCastControls = false;
+        }
+    }
+
+    private void SetLocalMediaCastPlayback(bool shouldPlay)
+    {
+        if (!_mediaCastActive) return;
+        if (_mediaTerminalStatus != MediaCastPlaybackStatus.Unknown)
+        {
+            if (!shouldPlay) return;
+            var restartAt = _mediaTerminalStatus is MediaCastPlaybackStatus.Stopped or MediaCastPlaybackStatus.Completed
+                ? 0 : _mediaStartPosition;
+            _mediaShouldPlay = true;
+            _mediaPrematureEndRetried = false;
+            SeekMediaCastToPosition(restartAt, allowCoalesce: false);
+        }
+        try
+        {
+            _mediaShouldPlay = shouldPlay;
+            SetMediaCastTimelineRunning(false);
+            if (_mediaOpened)
+            {
+                if (shouldPlay) MediaCastMediaElement.Play();
+                else MediaCastMediaElement.Pause();
+            }
+            if (shouldPlay) RestartMediaCastAudioAtCurrentPosition();
+            else _mediaCastAudioDecoder.Stop();
+            _mediaPlaying = shouldPlay && _mediaOpened;
+            SynchronizeMediaCastTimelineClock();
+            UpdateMediaCastControls();
+            if (_mediaOpened) ReportMediaCastPlayback();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_local_playback",
+                ("playing", shouldPlay),
+                ("position", ReadMediaCastPosition(MediaCastMediaElement).ToString("F3"))));
+        }
+        catch (InvalidOperationException error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_local_playback_failed",
+                ("playing", shouldPlay),
+                ("error", AppLog.Error(SanitizeMediaError(error.Message)))));
+        }
+    }
+
+    private void RestartMediaCastAudioAtCurrentPosition()
+    {
+        if (!_mediaCastActive || !_mediaShouldPlay || _mediaSource is null) return;
+        StartMediaCastAudioAt(ReadMediaCastTimelinePosition());
+    }
+
+    private void StartMediaCastAudioAt(double position)
+    {
+        if (!_mediaCastActive || !_mediaShouldPlay || _mediaSource is null) return;
+        if (!_viewModel.NeedsMediaCastAudioDecode)
+        {
+            _mediaCastAudioDecoder.Stop();
+            return;
+        }
+        _mediaCastAudioDecoder.Start(_mediaSource, position, _mediaPlaybackSpeed,
+            message => _viewModel.AddDiagnosticLog(AppLog.Event("media_audio",
+                ("message", AppLog.Error(message)))));
+    }
+
+    private void SeekMediaCastLocally(double requestedPosition)
+    {
+        var duration = ReadMediaCastDuration(MediaCastMediaElement);
+        if (!CanSeekMediaCastTimeline(duration))
+        {
+            LogMediaSeekDiagnostic("seek_commit_ignored", requestedPosition);
+            return;
+        }
+        var target = MediaCastPlaybackControls.ClampPosition(
+            requestedPosition, duration);
+        LogMediaSeekDiagnostic("seek_commit", target);
+        SeekMediaCastToPosition(target, allowCoalesce: false);
+    }
+
+    private bool CanSeekMediaCastTimeline(double duration)
+    {
+        var canReopen = _mediaSource is not null &&
+            _mediaTerminalStatus is MediaCastPlaybackStatus.Completed or MediaCastPlaybackStatus.Failed;
+        return _mediaCastActive && !_mediaBuffering && !_mediaWaitingForFirstFrame &&
+            !_mediaPendingHlsSeekPosition.HasValue && !_mediaSeekLoading &&
+            MediaCastPlaybackControls.CanSeek(_mediaOpened || canReopen,
+                _mediaIsLive, duration);
+    }
+
+    private bool IsLikelyMediaCastStartupSeek(double target)
+    {
+        if (!_mediaCastActive || !_mediaUsesHlsBridge ||
+            DateTime.UtcNow - _mediaOpenedAtUtc > TimeSpan.FromSeconds(8))
+            return false;
+        // The sender can issue its initial one-second correction before WPF
+        // raises MediaOpened. Compare against the programme clock instead of
+        // the not-yet-open local element so that correction is coalesced and
+        // cannot restart the HLS bridge from the beginning.
+        var current = ReadMediaCastTimelinePosition();
+        if (!double.IsFinite(current) || Math.Abs(target - current) > 8)
+            return false;
+        // iQIYI commonly reports 1-3 seconds after the first frame even when
+        // the programme was opened at zero. Keep a small acknowledgement
+        // window so a user can still issue a real phone seek immediately
+        // after casting without being coalesced into the startup correction.
+        return Math.Abs(target - _mediaOpeningPosition) <= 4;
+    }
+
+    private void OnMediaCastPlayPauseClick(object sender, RoutedEventArgs e) =>
+        SetLocalMediaCastPlayback(!_mediaShouldPlay);
+
+    private void OnMediaCastSeekBackwardClick(object sender, RoutedEventArgs e) =>
+        SeekMediaCastLocally(ReadMediaCastControlPosition(MediaCastMediaElement) - 10);
+
+    private void OnMediaCastSeekForwardClick(object sender, RoutedEventArgs e) =>
+        SeekMediaCastLocally(ReadMediaCastControlPosition(MediaCastMediaElement) + 10);
+
+    private void OnMediaCastSeekPointerDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Left) return;
+        var pendingHlsSeek = ReadMediaCastPendingHlsSeekPosition();
+        var duration = _mediaProgramDuration > 0
+            ? _mediaProgramDuration : ReadMediaCastDuration(MediaCastMediaElement);
+        var canInteract = CanSeekMediaCastTimeline(duration) && !pendingHlsSeek.HasValue;
+        if (!MediaCastSeekSlider.IsEnabled || !canInteract)
+        {
+            LogMediaSeekDiagnostic("seek_pointer_down_ignored");
+            e.Handled = true;
+            return;
+        }
+        RevealMediaCastControls(scheduleAutoHide: false);
+        _mediaSeekInteraction = true;
+        _mediaSeekCommitPending = true;
+        _mediaSeekInteractionTarget = MediaCastSeekSlider.Value;
+        LogMediaSeekDiagnostic("seek_pointer_down");
+        // Own the complete pointer transaction. WPF's Slider/Thumb class
+        // handlers can otherwise capture the Thumb and write Value a second
+        // time after the track calculation, which is the source of the
+        // visible jump while a seek is loading. The media timeline is updated
+        // from one proportional target until MouseUp commits it once.
+        _mediaSeekTrackInteraction = true;
+        e.Handled = true;
+        UpdateMediaCastSeekFromPointer(e);
+        MediaCastSeekSlider.CaptureMouse();
+    }
+
+    private void OnMediaCastSeekPointerMove(object sender, MouseEventArgs e)
+    {
+        if (!_mediaSeekInteraction || !_mediaSeekTrackInteraction) return;
+        UpdateMediaCastSeekFromPointer(e);
+        e.Handled = true;
+    }
+
+    private void OnMediaCastSeekPointerUp(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ChangedButton != MouseButton.Left) return;
+        if (!_mediaSeekInteraction) return;
+        var target = _mediaSeekInteractionTarget;
+        var trackInteraction = _mediaSeekTrackInteraction;
+        _mediaSeekInteraction = false;
+        _mediaSeekCommitPending = false;
+        _mediaSeekTrackInteraction = false;
+        if (trackInteraction && Mouse.Captured == MediaCastSeekSlider)
+            Mouse.Capture(null);
+        e.Handled = trackInteraction;
+        LogMediaSeekDiagnostic("seek_pointer_up", target);
+        SeekMediaCastLocally(target);
+        ScheduleMediaCastControlsAutoHide();
+    }
+
+    private void OnMediaCastSeekLostCapture(object sender, MouseEventArgs e)
+    {
+        if (!_mediaSeekInteraction || !_mediaSeekCommitPending) return;
+        _mediaSeekInteraction = false;
+        _mediaSeekCommitPending = false;
+        _mediaSeekTrackInteraction = false;
+        // Lost capture is cleanup only. WPF raises it when a template is
+        // reloaded or focus moves; committing here submits whatever stale
+        // value happened to be in the Slider at that instant and causes the
+        // visible thumb to jump. A real release is committed by MouseUp.
+        LogMediaSeekDiagnostic("seek_lost_capture", _mediaSeekInteractionTarget);
+        UpdateMediaCastControls();
+        ScheduleMediaCastControlsAutoHide();
+    }
+
+    private void UpdateMediaCastSeekFromPointer(MouseEventArgs e)
+    {
+        // Match the visual rail geometry: WPF positions the Thumb by its
+        // centre, so the first/last reachable centres are half a Thumb in from
+        // the rail edges. Using the whole Slider width makes edge clicks miss
+        // by several seconds on a long programme.
+        MediaCastSeekSlider.ApplyTemplate();
+        if (MediaCastSeekSlider.Template.FindName("PART_Track",
+                MediaCastSeekSlider) is not Track track) return;
+        var width = track.ActualWidth;
+        var thumbWidth = track.Thumb?.ActualWidth ?? 0;
+        if (!double.IsFinite(width) || width <= 0) return;
+        if (!double.IsFinite(thumbWidth) || thumbWidth < 0) thumbWidth = 0;
+        var railStart = thumbWidth / 2;
+        var railEnd = Math.Max(railStart, width - railStart);
+        var point = e.GetPosition(track);
+        var ratio = railEnd <= railStart
+            ? 0
+            : Math.Clamp((point.X - railStart) / (railEnd - railStart), 0, 1);
+        var target = MediaCastSeekSlider.Minimum +
+            (MediaCastSeekSlider.Maximum - MediaCastSeekSlider.Minimum) * ratio;
+        if (!double.IsFinite(target)) return;
+        var value = MediaCastPlaybackControls.ClampPosition(
+            target, MediaCastSeekSlider.Maximum);
+        _mediaSeekInteractionTarget = value;
+        MediaCastSeekSlider.Value = value;
+    }
+
+    private void OnMediaCastSeekValueChanged(
+        object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_updatingMediaCastControls || !MediaCastSeekSlider.IsEnabled) return;
+        if (_mediaSeekInteraction)
+            _mediaSeekInteractionTarget = MediaCastPlaybackControls.ClampPosition(
+                e.NewValue, MediaCastSeekSlider.Maximum);
+        MediaCastCurrentTimeText.Text = MediaCastPlaybackControls.FormatTime(e.NewValue);
+        // ValueChanged is also raised for every programmatic sync while an
+        // HLS element is opening. Never treat that notification as a seek;
+        // explicit mouse-up or keyboard-up handlers below are the only commit
+        // points. This prevents a stale focused slider from restarting HLS
+        // during loading and making its thumb jump between positions.
+    }
+
+    private void OnMediaCastSeekKeyUp(object sender, KeyEventArgs e)
+    {
+        if (e.Key is not (Key.Left or Key.Right or Key.Up or Key.Down or
+            Key.PageUp or Key.PageDown or Key.Home or Key.End)) return;
+        if (_mediaSeekInteraction || !MediaCastSeekSlider.IsKeyboardFocusWithin)
+            return;
+        var target = MediaCastSeekSlider.Value;
+        SeekMediaCastLocally(target);
+    }
+
+    private void LogMediaSeekDiagnostic(string eventName, double? target = null)
+    {
+        _viewModel.AddDiagnosticLog(AppLog.Event(eventName,
+            ("value", MediaCastSeekSlider.Value.ToString("F3")),
+            ("target", (target ?? _mediaSeekInteractionTarget).ToString("F3")),
+            ("maximum", MediaCastSeekSlider.Maximum.ToString("F3")),
+            ("interaction", _mediaSeekInteraction),
+            ("track_interaction", _mediaSeekTrackInteraction),
+            ("commit_pending", _mediaSeekCommitPending),
+            ("seek_loading", _mediaSeekLoading),
+            ("pending_hls", _mediaPendingHlsSeekPosition.HasValue),
+            ("opened", _mediaOpened),
+            ("buffering", _mediaBuffering)));
+    }
+
+    private void OnMediaCastMuteClick(object sender, RoutedEventArgs e)
+    {
+        if (!_mediaCastActive) return;
+        MediaCastMediaElement.IsMuted = !MediaCastMediaElement.IsMuted;
+        _viewModel.UpdateMediaCastAudioControls(!MediaCastMediaElement.IsMuted,
+            MediaCastMediaElement.Volume);
+        UpdateMediaCastStatistics();
+        UpdateMediaCastControls();
+    }
+
+    private void OnMediaCastVolumeValueChanged(
+        object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_updatingMediaCastControls || !_mediaCastActive) return;
+        var volume = Math.Clamp(e.NewValue / 100, 0, 1);
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_local_volume",
+            ("volume", volume.ToString("F3")),
+            ("position", ReadMediaCastPosition(MediaCastMediaElement).ToString("F3")),
+            ("opened", _mediaOpened), ("buffering", _mediaBuffering)));
+        MediaCastMediaElement.Volume = volume;
+        _viewModel.UpdateMediaCastAudioControls(
+            !MediaCastMediaElement.IsMuted, volume);
+        UpdateMediaCastStatistics();
+        UpdateMediaCastControls();
+    }
+
+    private void OnMediaCastSpeedSelectionChanged(object sender,
+        SelectionChangedEventArgs e)
+    {
+        if (_updatingMediaCastControls || !_mediaCastActive ||
+            MediaCastSpeedComboBox.SelectedItem is not ComboBoxItem item ||
+            !double.TryParse(item.Tag?.ToString(), NumberStyles.Float,
+                CultureInfo.InvariantCulture, out var speed) ||
+            !double.IsFinite(speed) || speed <= 0)
+            return;
+        try
+        {
+            var requested = Math.Clamp(speed, 0.5, 2.0);
+            _mediaSpeedFallbackPromptShown = false;
+            if (!ApplyMediaCastSpeed(MediaCastMediaElement, requested))
+            {
+                SetMediaCastTimelineRunning(_mediaTimelineRunning);
+                _mediaPlaybackSpeed = 1.0;
+                _mediaSpeedFallbackPending = false;
+                MediaCastSpeedComboBox.SelectedIndex = 2;
+                NotifyMediaCastSpeedFallback(requested);
+                return;
+            }
+            // Re-anchor with the old rate before changing the clock scale.
+            SetMediaCastTimelineRunning(_mediaTimelineRunning);
+            _mediaPlaybackSpeed = requested;
+            _mediaSpeedFallbackPending = requested != 1.0;
+            _mediaSpeedChangedUtc = DateTime.UtcNow;
+            if (_mediaShouldPlay) RestartMediaCastAudioAtCurrentPosition();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_speed_applied",
+                ("speed", _mediaPlaybackSpeed.ToString("F2",
+                    CultureInfo.InvariantCulture)),
+                ("opened", _mediaOpened), ("playing", _mediaShouldPlay)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_speed_failed",
+                ("speed", speed.ToString("F2", CultureInfo.InvariantCulture)),
+                ("error", AppLog.Error(SanitizeMediaError(error.Message)))));
+            UpdateMediaCastControls();
+        }
+    }
+
+    private bool ApplyMediaCastSpeed(MediaElement mediaElement, double speed)
+    {
+        speed = Math.Clamp(speed, 0.5, 2.0);
+        var resume = _mediaOpened && _mediaShouldPlay;
+        try
+        {
+            if (resume) mediaElement.Pause();
+            mediaElement.SpeedRatio = speed;
+            if (resume) mediaElement.Play();
+            return true;
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_speed_failed",
+                ("speed", speed.ToString("F2", CultureInfo.InvariantCulture)),
+                ("error", AppLog.Error(SanitizeMediaError(error.Message)))));
+            try { mediaElement.SpeedRatio = 1.0; }
+            catch (InvalidOperationException) { }
+            return false;
+        }
+    }
+
+    private void NotifyMediaCastSpeedFallback(double requestedSpeed)
+    {
+        if (_mediaSpeedFallbackPromptShown) return;
+        _mediaSpeedFallbackPromptShown = true;
+        _viewModel.AddUiLog(LocalizationService.Format(
+            "MediaCastSpeedUnsupportedBody", $"{requestedSpeed:0.##}x"));
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        {
+            if (_mediaCastActive)
+                AppPromptWindow.Inform(
+                    LocalizationService.Get("MediaCastSpeedUnsupportedTitle"),
+                    LocalizationService.Format(
+                        "MediaCastSpeedUnsupportedBody", $"{requestedSpeed:0.##}x"));
+        });
+    }
+
+    private static int GetMediaCastSpeedIndex(double speed)
+    {
+        var speeds = new[] { 0.5, 0.75, 1.0, 1.25, 1.5, 2.0 };
+        var index = 0;
+        var distance = double.PositiveInfinity;
+        for (var i = 0; i < speeds.Length; ++i)
+        {
+            var candidateDistance = Math.Abs(speed - speeds[i]);
+            if (candidateDistance >= distance) continue;
+            distance = candidateDistance;
+            index = i;
+        }
+        return index;
+    }
+
+    private void QueueMediaCastCompletion(bool naturalEnd = false)
+    {
+        if (_mediaTerminalStatus != MediaCastPlaybackStatus.Unknown) return;
+        if (naturalEnd)
+        {
+            if (_mediaUsesHlsBridge && MediaCastPlaybackControls.IsPrematureEnd(
+                    _mediaProgramDuration, _mediaStartPosition))
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("media_premature_eof",
+                    ("position", _mediaStartPosition), ("duration", _mediaProgramDuration)));
+                if (!_mediaPrematureEndRetried)
+                {
+                    _mediaPrematureEndRetried = true;
+                    _mediaShouldPlay = true;
+                    DisposeHlsMediaBridge();
+                    _mediaPlaybackSource = null;
+                    QueueLiveMediaRecovery("media ended before the final playback position");
+                }
+                else
+                {
+                    FinishMediaCastItem(completed: false,
+                        "media ended before the final playback position");
+                    _viewModel.AddUiLog(LocalizationService.Format("MediaCastPlaybackFailedFormat", "media ended before the final playback position"));
+                }
+                return;
+            }
+            // Every source, including external HLS and direct MP4, must end
+            // the item without cancelling the sender's queue/session.
+            FinishMediaCastItem(completed: true);
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_item_completed",
+                ("command", _mediaCommandId), ("duration", _mediaProgramDuration)));
+            return;
+        }
+        var generation = _mediaCastEvents.CurrentGeneration;
+        Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        {
+            if (_mediaCastActive && generation == _mediaCastEvents.CurrentGeneration)
+                _viewModel.RequestMediaCastStop();
+        });
+    }
+
+    private void FinishMediaCastItem(bool completed, string? reason = null)
+    {
+        var position = completed && _mediaProgramDuration > 0
+            ? _mediaProgramDuration : _mediaStartPosition;
+        _mediaTerminalStatus = completed
+            ? MediaCastPlaybackStatus.Completed : MediaCastPlaybackStatus.Failed;
+        CancelMediaRecovery();
+        ++_mediaRecoveryRevision;
+        _mediaOpeningTimer.Stop();
+        _mediaPlaybackTimer.Stop();
+        _mediaShouldPlay = false;
+        _mediaPlaying = false;
+        _mediaOpened = false;
+        _mediaBuffering = false;
+        _mediaWaitingForFirstFrame = false;
+        _mediaSeekLoading = false;
+        ClearMediaCastPendingHlsSeek();
+        ClearMediaCastPendingSeek();
+        SetMediaCastTimelinePosition(position, running: false);
+        _mediaCastAudioDecoder.Stop();
+        if (completed)
+            MediaCastStatusPanel.Visibility = Visibility.Collapsed;
+        else
+        {
+            MediaCastStatusText.Text = LocalizationService.Format(
+                "MediaCastPlaybackFailedFormat", reason ?? "playback failed");
+            MediaCastStatusPanel.Visibility = Visibility.Visible;
+            // Stop any remaining network/decoder work while retaining the
+            // sender's session so a new item can still arrive.
+            DisposeHlsMediaBridge();
+            DisposeMediaHttpProxyBridge();
+        }
+        ReportMediaCastPlayback();
+    }
+
+    private string SanitizeMediaError(string message)
+    {
+        if (_mediaSource is not null)
+            message = message.Replace(_mediaSource.AbsoluteUri, "<media-url>",
+                StringComparison.OrdinalIgnoreCase);
+        return AppLog.Sanitize(message);
+    }
+
+    private void QueueLiveMediaRecovery(string reason)
+    {
+        if (!_mediaCastActive || (!_mediaIsLive && !_mediaUsesHlsBridge) ||
+            _mediaSource is null ||
+            _mediaTerminalStatus != MediaCastPlaybackStatus.Unknown) return;
+        var generation = _mediaCastEvents.CurrentGeneration;
+        var revision = ++_mediaRecoveryRevision;
+        var source = _mediaSource;
+        if (!_mediaRecoveryBackoff.TryGetNext(out var attempt, out var delay))
+        {
+            _viewModel.AddUiLog(LocalizationService.Format(
+                "MediaCastPlaybackFailedFormat", AppLog.Error(reason)));
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_recovery_exhausted",
+                ("generation", generation), ("revision", revision),
+                ("attempts", attempt), ("source", AppLog.MediaSource(source)),
+                ("reason", AppLog.Error(reason))));
+            // Exhausting this item's recovery must not cancel the sender's
+            // queue, including when HLS uses an external signed media URL.
+            FinishMediaCastItem(completed: false, reason);
+            return;
+        }
+        // Recovery freezes the programme clock and is explicitly loading.
+        // This must happen before the delayed replacement begins.
+        SetMediaCastTimelineRunning(false);
+        // Every recovery retires the old forward-only HTTP consumer. Leaving
+        // it bound during the delay lets queued callbacks cancel recovery, or
+        // lets a replacement consume an already-used transport midstream.
+        _mediaCastEvents.TryUnbind(generation, MediaCastMediaElement);
+        _mediaOpened = false;
+        DisposeHlsMediaBridge();
+        _mediaPlaybackSource = null;
+        ReportMediaCastPlayback();
+        _viewModel.AddUiLog(AppLog.Event("live media reconnect",
+            ("delay_ms", delay.TotalMilliseconds.ToString("F0")),
+            ("attempt", attempt), ("reason", AppLog.Error(reason))));
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_recovery_queued",
+            ("generation", generation), ("revision", revision),
+            ("attempt", attempt), ("delay_ms", delay.TotalMilliseconds.ToString("F0")),
+            ("source", AppLog.MediaSource(source)), ("reason", AppLog.Error(reason))));
+        _ = RecoverLiveMediaAsync(generation, revision, source, delay,
+            _mediaRecoveryCancellation.Token);
+    }
+
+    private async Task RecoverLiveMediaAsync(
+        long generation, int revision, Uri source, TimeSpan delay,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(delay, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+        if (_shutdownStarted || !_mediaCastActive ||
+            (!_mediaIsLive && !_mediaUsesHlsBridge) ||
+            generation != _mediaCastEvents.CurrentGeneration ||
+            revision != _mediaRecoveryRevision ||
+            _mediaTerminalStatus != MediaCastPlaybackStatus.Unknown ||
+            !Equals(source, _mediaSource)) return;
+
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_recovery_begin",
+            ("generation", generation), ("revision", revision),
+            ("delay_ms", delay.TotalMilliseconds.ToString("F0")),
+            ("source", AppLog.MediaSource(source))));
+        try
+        {
+            // Reloading is reserved for live-stream recovery. User Seek/Resume
+            // commands continue to operate directly on the existing MediaElement.
+            var audioEnabled = !MediaCastMediaElement.IsMuted;
+            var volume = MediaCastMediaElement.Volume;
+            if (_mediaHlsBridge is null || !_mediaHlsBridge.IsRunning)
+            {
+                _mediaCastAudioDecoder.Stop();
+                DisposeHlsMediaBridge();
+                _mediaBridgeOffset = Math.Max(0, _mediaStartPosition);
+                _mediaPlaybackSource = source;
+                _mediaHlsBridge = HlsMediaPlaybackBridge.TryStart(source,
+                    _mediaBridgeOffset,
+                    message => _viewModel.AddDiagnosticLog(AppLog.Event("hls_bridge",
+                        ("message", AppLog.Error(message)))),
+                    duration => QueueHlsProgramDuration(
+                        generation, source, duration));
+                if (_mediaHlsBridge is not null)
+                    _mediaPlaybackSource = _mediaHlsBridge.PlaybackUri;
+                else if (_mediaUsesHlsBridge)
+                    throw new InvalidOperationException(
+                        LocalizationService.Get("HlsRestartFailed"));
+            }
+            _mediaOpened = false;
+            // Keep the sender's transport in PLAYING while the next HLS
+            // window is being opened. The local MediaElement is temporarily
+            // closed, but this is a segment hand-off rather than a programme
+            // completion.
+            _mediaPlaying = _mediaShouldPlay;
+            _mediaBuffering = false;
+            _mediaWaitingForFirstFrame = true;
+            _mediaOpeningPosition = ClampMediaPosition(
+                _mediaStartPosition, clampToDuration: true);
+            _mediaOpenedAtUtc = DateTime.UtcNow;
+            _mediaProgressSampleUtc = _mediaOpenedAtUtc;
+            ShowMediaCastStatus("MediaCastLoadingVideo");
+            _mediaOpeningTimer.Start();
+            if (!ReplaceMediaCastMediaElement(
+                    _mediaPlaybackSource ?? source, generation,
+                    audioEnabled, volume)) return;
+            if (_mediaHlsBridge is null)
+            {
+                if (_mediaShouldPlay) MediaCastMediaElement.Play();
+                else MediaCastMediaElement.Pause();
+            }
+            _mediaPlaybackTimer.Start();
+            UpdateMediaCastControls();
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_recovery_submitted",
+                ("generation", generation), ("revision", revision),
+                ("source", AppLog.MediaSource(source))));
+        }
+        catch (Exception error)
+        {
+            var message = SanitizeMediaError(error.Message);
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_recovery_failed",
+                ("generation", generation), ("revision", revision),
+                ("source", AppLog.MediaSource(source)),
+                ("error", AppLog.Error(message, error.GetType().Name))));
+            _viewModel.AddUiLog(LocalizationService.Format(
+                "MediaCastLiveRecoveringFormat", message));
+            QueueLiveMediaRecovery(message);
+        }
+    }
+
+    private void ResetMediaRecoveryCancellation()
+    {
+        var previous = _mediaRecoveryCancellation;
+        _mediaRecoveryCancellation = new CancellationTokenSource();
+        try { previous.Cancel(); }
+        finally { previous.Dispose(); }
+    }
+
+    private void CancelMediaRecovery()
+    {
+        try { _mediaRecoveryCancellation.Cancel(); }
+        catch (ObjectDisposedException)
+        {
+            // A replacement Play can dispose the previous generation while a
+            // delayed continuation is unwinding.
+        }
+    }
+
+    private void OnRefreshPreviewClick(object sender, RoutedEventArgs e) => RefreshPreview();
+
+    internal void EnableDeveloperToolsFromAbout()
+    {
+        _viewModel.EnableAdvancedMode();
+        _viewModel.AddUiLog(LocalizationService.Get("AdvancedModeEnabled"));
+        OpenDeveloperTools();
+    }
+
+    private void OpenDeveloperTools()
+    {
+        // Developer tools must remain a regular, non-topmost inspection window.
+        Topmost = false;
+        if (_developerToolsWindow is not null)
+        {
+            _developerToolsWindow.Topmost = false;
+            _developerToolsWindow.Activate();
+            _developerToolsWindow.Focus();
+            return;
+        }
+        try
+        {
+            // Keep this as an independent window. WPF owned windows are always
+            // kept above their owner, which prevents the main window covering
+            // the developer tools during layout and z-order inspection.
+            var window = new DeveloperToolsWindow(this) { Topmost = false };
+            _developerToolsWindow = window;
+            window.Closed += (_, _) =>
+            {
+                if (ReferenceEquals(_developerToolsWindow, window))
+                    _developerToolsWindow = null;
+            };
+            window.Show();
+            window.Activate();
+        }
+        catch (Exception error)
+        {
+            _developerToolsWindow = null;
+            DiagnosticLogger.Exception("ui", "developer_tools_open_failed", error);
+            AppPromptWindow.Inform(
+                LocalizationService.Get("DeveloperToolsTitle"), error.Message);
+        }
+    }
+
+    internal void OpenDeveloperSurface(string key)
+    {
+        switch (key)
+        {
+            case "first-run-setup":
+                if (ShowFirstRunSetup(rerun: true)) StartAfterSetup();
+                break;
+            case "workspace-mirroring":
+                OnNavigateMirroringClick(this, new RoutedEventArgs());
+                break;
+            case "workspace-devices":
+                OnNavigateDevicesClick(this, new RoutedEventArgs());
+                break;
+            case "workspace-settings":
+                OnNavigateSettingsClick(this, new RoutedEventArgs());
+                break;
+            case "workspace-output":
+                OnNavigateOutputClick(this, new RoutedEventArgs());
+                break;
+            case "driver-manager":
+                OnNavigateDriverClick(this, new RoutedEventArgs());
+                break;
+            case "about":
+                OnAboutClick(this, new RoutedEventArgs());
+                break;
+            case "device-hub":
+                OpenDeveloperTools();
+                _developerToolsWindow?.ShowDeviceTools();
+                break;
+            case "advanced-settings":
+                new AdvancedSettingsWindow(1920, 1080, previewOnly: true)
+                    { Owner = this }.Show();
+                break;
+            case "text-input":
+                TextInputWindow.ShowDeveloperPreview(this);
+                break;
+            case "device-binding":
+                DeviceBindingWindow.ShowDeveloperPreview(this, _viewModel);
+                break;
+            case "airplay-device-selection":
+                AirPlayDeviceSelectionWindow.ShowDeveloperPreview(this);
+                break;
+            case "bluetooth-connection":
+                BluetoothConnectionWindow.ShowDeveloperPreview(this);
+                break;
+            case "bluetooth-client-binding":
+                BluetoothClientBindingWindow.ShowDeveloperPreview(this);
+                break;
+            case "bluetooth-control-notice":
+                BluetoothControlNoticeWindow.ShowDeveloperPreview(this);
+                break;
+            case "shortcut-settings":
+                ShortcutSettingsWindow.ShowDeveloperPreview(this);
+                break;
+            case "reverse-control-status":
+                ReverseControlStatusWindow.ShowDeveloperPreview(this);
+                break;
+            case "prompt":
+                AppPromptWindow.ShowDeveloperPreview(this);
+                break;
+            case "reverse-control-wired-prerequisite":
+                AppPromptWindow.ShowReverseControlPrerequisitePreview(this, wireless: false);
+                break;
+            case "reverse-control-wireless-prerequisite":
+                AppPromptWindow.ShowReverseControlPrerequisitePreview(this, wireless: true);
+                break;
+            case "reverse-control-error":
+                CaptureStatusNoticeWindow.ShowDeveloperReverseControlErrorPreview(this);
+                break;
+            case "capture-error":
+                CaptureStatusNoticeWindow.ShowDeveloperErrorPreview(this);
+                break;
+            case "session-closed":
+                CaptureStatusNoticeWindow.ShowDeveloperStoppedPreview(this);
+                break;
+            case "usb-config-error":
+                CaptureStatusNoticeWindow.ShowDeveloperUsbPreview(this);
+                break;
+            case "capture-recovery":
+                CaptureRecoveryWindow.ShowDeveloperPreview(this);
+                break;
+            case "image-settings":
+                ImageSettingsWindow.ShowDeveloperPreview(this);
+                break;
+            case "projection-settings":
+                ShowDeveloperProjectionSettings();
+                break;
+            case "media-output":
+                ShowDeveloperMediaOutputSettings();
+                break;
+            case "usb-mode":
+                if (_viewModel.UsbProjectionModes.FirstOrDefault() is { } option)
+                    new UsbProjectionModeInfoWindow(option) { Owner = this }.Show();
+                break;
+            case "startup-error":
+                new StartupErrorWindow(
+                    new InvalidOperationException(LocalizationService.Get("DeveloperStartupErrorBody")),
+                    DiagnosticLogger.Path) { Owner = this }.Show();
+                break;
+            case "update":
+                if (Application.Current is App app) app.ShowDeveloperUpdateWindow(this);
+                break;
+            case "instance-conflict":
+                InstanceConflictWindow.ShowDeveloperPreview(this);
+                break;
+            case "protected-content":
+                ProtectedContentNoticeWindow.ShowDeveloperPreview(this);
+                break;
+            case "native-preview":
+                ShowDeveloperNativePreview();
+                break;
+        }
+    }
+
+    private void ShowDeveloperProjectionSettings()
+    {
+        var window = new ProjectionSettingsWindow(_viewModel,
+            () => Task.CompletedTask, () => Task.CompletedTask,
+            () => Task.CompletedTask, () => Task.CompletedTask,
+            () => { }) { Owner = this };
+        window.Show();
+    }
+
+    private void ShowDeveloperMediaOutputSettings()
+    {
+        var window = new MediaOutputSettingsWindow(_viewModel, previewOnly: true)
+        {
+            Owner = this,
+        };
+        window.Show();
+    }
+
+    private void ShowDeveloperNativePreview()
+    {
+        var content = new Border
+        {
+            Background = (Brush)FindResource("PreviewPanelAltBrush"),
+            Padding = new Thickness(32),
+            Child = new StackPanel
+            {
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = LocalizationService.Get("DeveloperNativePreviewBody"),
+                        FontSize = 22,
+                        FontWeight = FontWeights.SemiBold,
+                        TextAlignment = TextAlignment.Center,
+                    },
+                    new TextBlock
+                    {
+                        Text = "1920 × 1080",
+                        Foreground = (Brush)FindResource("PreviewMutedTextBrush"),
+                        FontSize = 13,
+                        Margin = new Thickness(0, 10, 0, 0),
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                    },
+                },
+            },
+        };
+        content.SetResourceReference(Border.BackgroundProperty, "PreviewPanelAltBrush");
+        var previewLabels = ((StackPanel)content.Child).Children.OfType<TextBlock>().ToArray();
+        previewLabels[0].SetResourceReference(TextBlock.TextProperty, "DeveloperNativePreviewBody");
+        previewLabels[0].SetResourceReference(TextBlock.FontSizeProperty, "FontSize22");
+        previewLabels[0].SetResourceReference(TextBlock.ForegroundProperty, "PreviewTextBrush");
+        previewLabels[0].TextWrapping = TextWrapping.Wrap;
+        previewLabels[1].SetResourceReference(TextBlock.FontSizeProperty, "BodyFontSize");
+        previewLabels[1].SetResourceReference(TextBlock.ForegroundProperty, "PreviewMutedTextBrush");
+        NativePreviewWindow.TryCreateAndShowForContent(content, 1920, 1080,
+            LocalizationService.Get("DeveloperNativePreviewTitle"),
+            () => true, _ => { }, () => 1, () => { }, () => { },
+            out _, message => _viewModel.AddDiagnosticLog(message));
+    }
+
+    private void OnUsbProjectionModeInfoClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { DataContext: UsbProjectionModeOption option }) return;
+        e.Handled = true;
+        new Windows.UsbProjectionModeInfoWindow(option) { Owner = this }.ShowDialog();
+    }
+
+    private void OnDeviceListRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        DependencyObject? current = e.OriginalSource as DependencyObject;
+        while (current is not null && current is not ListBoxItem)
+            current = VisualTreeHelper.GetParent(current);
+        if (current is not ListBoxItem item || item.ContextMenu is null) return;
+        if (item.DataContext is DeviceViewModel { IsMediaCast: true })
+        {
+            e.Handled = true;
+            return;
+        }
+
+        // WPF selects a ListBoxItem on right-click before opening its menu.
+        // That would stop the current phone as a normal device switch. Open
+        // the item's menu ourselves and leave the active selection untouched.
+        e.Handled = true;
+        item.ContextMenu.PlacementTarget = item;
+        item.ContextMenu.IsOpen = true;
+    }
+
+    private void OnDeviceListLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        var item = FindListBoxItem(e.OriginalSource as DependencyObject);
+        if (item?.DataContext is not DeviceViewModel device) return;
+        _pressedDevice = device;
+        _devicePressPoint = e.GetPosition(DeviceListBox);
+        _devicePressStartedUtc = DateTime.UtcNow;
+        _deviceDragStarted = false;
+        DeviceListBox.CaptureMouse();
+        e.Handled = true;
+    }
+
+    private void OnDeviceListMouseMove(object sender, MouseEventArgs e)
+    {
+        if (_pressedDevice is null || _deviceDragStarted ||
+            e.LeftButton != MouseButtonState.Pressed ||
+            DateTime.UtcNow - _devicePressStartedUtc < DeviceDragHoldDuration) return;
+
+        var current = e.GetPosition(DeviceListBox);
+        if (Math.Abs(current.X - _devicePressPoint.X) < SystemParameters.MinimumHorizontalDragDistance &&
+            Math.Abs(current.Y - _devicePressPoint.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+
+        var dragged = _pressedDevice;
+        _deviceDragStarted = true;
+        DeviceListBox.ReleaseMouseCapture();
+        e.Handled = true;
+        try
+        {
+            DragDrop.DoDragDrop(DeviceListBox, dragged, DragDropEffects.Move);
+        }
+        finally
+        {
+            ResetDeviceDragState();
+        }
+    }
+
+    private void OnDeviceListLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_pressedDevice is null) return;
+        var device = _pressedDevice;
+        var select = !_deviceDragStarted;
+        ResetDeviceDragState();
+        if (select) _ = SelectDeviceWithTransitionAsync(device);
+        e.Handled = true;
+    }
+
+    private async Task SelectDeviceWithTransitionAsync(DeviceViewModel device)
+    {
+        if (ReferenceEquals(_viewModel.SelectedDevice, device)) return;
+        var revision = Interlocked.Increment(ref _previewTransitionRevision);
+        var maskTransition = _viewModel.IsCapturing &&
+            !_viewModel.HasCaptureSessionFor(device);
+        if (!maskTransition)
+        {
+            PreviewTransitionMask.IsOpen = false;
+            DeviceListBox.SelectedItem = device;
+            return;
+        }
+
+        PreviewTransitionMask.IsOpen = true;
+        try
+        {
+            // A Popup owns a separate HWND and can cover WPF/HwndHost airspace.
+            // Give DWM two frames to present it before changing preview owners.
+            await Dispatcher.Yield(DispatcherPriority.Render);
+            await Task.Delay(34);
+            if (revision != _previewTransitionRevision || _shutdownStarted) return;
+            DeviceListBox.SelectedItem = device;
+            await Dispatcher.Yield(DispatcherPriority.Render);
+            await Task.Delay(100);
+        }
+        catch (Exception error)
+        {
+            if (!_shutdownStarted)
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("device_selection_transition_failed",
+                    ("device", AppLog.Device(device.Udid)),
+                    ("error", AppLog.Error(error))));
+            }
+        }
+        finally
+        {
+            if (revision == _previewTransitionRevision)
+                PreviewTransitionMask.IsOpen = false;
+        }
+    }
+
+    private void OnDeviceListDragOver(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetData(typeof(DeviceViewModel)) is not DeviceViewModel source)
+        {
+            e.Effects = DragDropEffects.None;
+            e.Handled = true;
+            return;
+        }
+        e.Effects = DragDropEffects.Move;
+        var item = FindListBoxItem(e.OriginalSource as DependencyObject);
+        var target = item?.DataContext as DeviceViewModel;
+        if (target is not null && !ReferenceEquals(source, target))
+        {
+            var before = CaptureDeviceItemPositions();
+            var placeAfter = e.GetPosition(item!).Y >= item!.ActualHeight / 2;
+            var oldIndex = _viewModel.Devices.IndexOf(source);
+            _viewModel.MoveDevice(source, target, placeAfter);
+            if (_viewModel.Devices.IndexOf(source) != oldIndex)
+                AnimateDeviceItemsFrom(before);
+        }
+        e.Handled = true;
+    }
+
+    private void OnDeviceListDrop(object sender, DragEventArgs e)
+    {
+        if (e.Data.GetData(typeof(DeviceViewModel)) is not DeviceViewModel source) return;
+        var item = FindListBoxItem(e.OriginalSource as DependencyObject);
+        var target = item?.DataContext as DeviceViewModel;
+        var placeAfter = item is not null && e.GetPosition(item).Y >= item.ActualHeight / 2;
+        _viewModel.MoveDevice(source, target, placeAfter);
+        e.Handled = true;
+    }
+
+    private void ResetDeviceDragState()
+    {
+        DeviceListBox.ReleaseMouseCapture();
+        _pressedDevice = null;
+        _deviceDragStarted = false;
+    }
+
+    private Dictionary<DeviceViewModel, double> CaptureDeviceItemPositions()
+    {
+        var positions = new Dictionary<DeviceViewModel, double>();
+        foreach (var device in _viewModel.Devices)
+            if (DeviceListBox.ItemContainerGenerator.ContainerFromItem(device) is ListBoxItem item)
+                positions[device] = item.TranslatePoint(default, DeviceListBox).Y;
+        return positions;
+    }
+
+    private void AnimateDeviceItemsFrom(IReadOnlyDictionary<DeviceViewModel, double> before)
+    {
+        DeviceListBox.UpdateLayout();
+        foreach (var device in _viewModel.Devices)
+        {
+            if (!before.TryGetValue(device, out var oldY) ||
+                DeviceListBox.ItemContainerGenerator.ContainerFromItem(device) is not ListBoxItem item)
+                continue;
+            var delta = oldY - item.TranslatePoint(default, DeviceListBox).Y;
+            if (Math.Abs(delta) < 0.5) continue;
+            var transform = item.RenderTransform as TranslateTransform ?? new TranslateTransform();
+            item.RenderTransform = transform;
+            transform.BeginAnimation(TranslateTransform.YProperty,
+                new DoubleAnimation(delta, 0, TimeSpan.FromMilliseconds(170))
+                { EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut } });
+        }
+    }
+
+    private static ListBoxItem? FindListBoxItem(DependencyObject? source)
+    {
+        while (source is not null && source is not ListBoxItem)
+            source = VisualTreeHelper.GetParent(source);
+        return source as ListBoxItem;
+    }
+
+    private void RefreshPreview()
+    {
+        _viewModel.AddDiagnosticLog(AppLog.Event("preview_refresh_begin",
+            ("mode", _mediaCastActive && _viewModel.IsMediaCastSelected
+                ? "media_cast" : _viewModel.SelectedDevice?.IsWireless == true
+                    ? "wireless" : "wired"),
+            ("independent", _mediaCastPreviewWindow is not null ||
+                _secondaryMirrors.IsOpen(_viewModel.SelectedDevice))));
+        var refreshed = _mediaCastActive && _viewModel.IsMediaCastSelected
+            ? RefreshMediaCastPreview()
+            :
+            (_secondaryMirrors.IsOpen(_viewModel.SelectedDevice)
+                ? _secondaryMirrors.Refresh(_viewModel.SelectedDevice)
+                : MainPreviewHost.ForceRefresh());
+        _viewModel.AddUiLog(LocalizationService.Get(
+            refreshed ? "PreviewRefreshed" : "PreviewRefreshFailed"));
+        _viewModel.AddDiagnosticLog(AppLog.Event("preview_refresh_complete",
+            ("success", refreshed)));
+    }
+
+    private bool RefreshMediaCastPreview()
+    {
+        if (_mediaCastPreviewWindow is not null)
+            return _mediaCastPreviewWindow.RefreshPreview();
+        MediaCastMediaElement.InvalidateVisual();
+        MediaCastSurface.InvalidateVisual();
+        return _mediaOpened;
+    }
+
+    private async void OnPreviewWindowClick(object sender, RoutedEventArgs e) =>
+        await OpenPreviewWindowAsync();
+
+    private async void OnStartBluetoothControlClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (!_viewModel.CanToggleBluetoothControl) return;
+            if (_viewModel.IsBluetoothControlEnabled)
+            {
+                await _viewModel.DisableBluetoothControlAsync();
+                return;
+            }
+            ShowReverseControlStatus(ControlStatusMode.Bluetooth);
+            _viewModel.AddDiagnosticLog(AppLog.Event("bluetooth_control_toolbar_start",
+                ("device", AppLog.Device(_viewModel.SelectedDevice?.Udid))));
+            await _viewModel.StartBluetoothControlAsync();
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddUiLog(LocalizationService.Format("BluetoothControlStartFailedFormat", error.Message));
+            _viewModel.AddDiagnosticLog(AppLog.Event("bluetooth_control_toolbar_failed",
+                ("error", AppLog.Error(error))));
+        }
+    }
+
+    private async void OnStartUsbControlClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            ShowReverseControlStatus(ControlStatusMode.Usb);
+            _viewModel.AddDiagnosticLog(AppLog.Event("usb_control_toolbar_toggle",
+                ("device", AppLog.Device(_viewModel.SelectedDevice?.Udid)),
+                ("wireless", _viewModel.IsWirelessSelected)));
+            await _viewModel.ToggleWiredControlAsync();
+        }
+        catch (Exception error)
+        {
+            var message = LocalizationService.Format("UsbControlOperationFailedFormat", error.Message);
+            _viewModel.AddUiLog(message);
+            AppPromptWindow.Warn(LocalizationService.Get("UsbControlTitle"), message, this);
+            _viewModel.AddDiagnosticLog(AppLog.Event("usb_control_toolbar_failed",
+                ("error", AppLog.Error(error))));
+        }
+    }
+
+    private async void OnStartWirelessControlClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            ShowReverseControlStatus(ControlStatusMode.Wireless);
+            _viewModel.AddDiagnosticLog(AppLog.Event("wireless_control_toolbar_toggle",
+                ("device", AppLog.Device(_viewModel.SelectedDevice?.Udid))));
+            await _viewModel.ToggleWirelessControlAsync();
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddUiLog(LocalizationService.Format("WirelessControlOperationFailedFormat", error.Message));
+            _viewModel.AddDiagnosticLog(AppLog.Event("wireless_control_toolbar_failed",
+                ("error", AppLog.Error(error))));
+        }
+    }
+
+    private async Task OpenPreviewWindowAsync()
+    {
+        try
+        {
+            if (_mediaCastActive && _viewModel.IsMediaCastSelected)
+            {
+                _viewModel.AddDiagnosticLog(AppLog.Event("preview_window_open_begin",
+                    ("mode", "media_cast"), ("opened", _mediaCastPreviewWindow is not null)));
+                ShowMediaCastPreviewWindow();
+                _viewModel.AddUiLog(LocalizationService.Get("PreviewWindowOpened"));
+                return;
+            }
+            var device = _viewModel.SelectedDevice;
+            if (device is null) return;
+            if (_viewModel.IsBluetoothControlEnabled)
+                await _viewModel.DisableBluetoothControlAsync();
+            _viewModel.AddDiagnosticLog(AppLog.Event("preview_window_open_begin",
+                ("mode", device.IsWireless ? "wireless" : "wired"),
+                ("device", AppLog.Device(device.Udid))));
+            var result = await _secondaryMirrors.ShowAsync(device);
+            if (!result.Success) throw new InvalidOperationException(result.Message);
+            QueueMainPreviewHostSync();
+            _secondaryMirrors.UpdateDevice(device,
+                _viewModel.SourceVideoWidth, _viewModel.SourceVideoHeight);
+            _viewModel.AddUiLog(LocalizationService.Get("PreviewWindowOpened"));
+            _viewModel.AddDiagnosticLog(AppLog.Event("preview_window_open_complete",
+                ("device", AppLog.Device(device.Udid)), ("success", true)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("preview_window_open_failed",
+                ("error", AppLog.Error(error))));
+            _viewModel.AddUiLog(LocalizationService.Format("PreviewWindowOpenFailedFormat", error.Message));
+        }
+    }
+
+    private void OnProjectionSettingsRequested(string udid)
+    {
+        if (IsTrayMode)
+        {
+            var device = _viewModel.Devices.FirstOrDefault(item => DeviceViewModel.UdidEquals(item.Udid, udid));
+            if (device is not null) _viewModel.SelectedDevice = device;
+            ShowTraySettings();
+            return;
+        }
+        var sessionHandle = _viewModel.GetDeviceSessionHandle(udid);
+        if (!DeviceViewModel.UdidEquals(_viewModel.SelectedDevice?.Udid, udid)) return;
+        if (_projectionSettingsWindow is not null)
+        {
+            if (DeviceViewModel.UdidEquals(_projectionSettingsUdid, udid) &&
+                _projectionSettingsSessionHandle == sessionHandle)
+            {
+                _projectionSettingsWindow.Activate();
+                _projectionSettingsWindow.Focus();
+                return;
+            }
+            _projectionSettingsWindow.Close();
+        }
+        var window = new ProjectionSettingsWindow(_viewModel,
+            () =>
+            {
+                RefreshPreview();
+                return Task.CompletedTask;
+            },
+            ToggleActiveFullScreenAsync,
+            OpenPreviewWindowAsync,
+            CaptureScreenshotAsync,
+            () => OnMediaOutputSettingsRequested(udid, sessionHandle))
+        {
+            Owner = this,
+        };
+        _secondaryMirrors.ConfigurePhoneFrameSettings(window);
+        _projectionSettingsWindow = window;
+        _projectionSettingsUdid = udid;
+        _projectionSettingsSessionHandle = sessionHandle;
+        window.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_projectionSettingsWindow, window))
+            {
+                _projectionSettingsWindow = null;
+                _projectionSettingsUdid = null;
+                _projectionSettingsSessionHandle = 0;
+            }
+        };
+        _viewModel.AddDiagnosticLog(AppLog.Event("projection_settings_window_opened",
+            ("device", AppLog.Device(udid)),
+            ("handle", AppLog.Handle(sessionHandle))));
+        window.Show();
+    }
+
+    private void OnMediaOutputSettingsRequested() => OnMediaOutputSettingsRequested(
+        _viewModel.SelectedDevice?.Udid, _viewModel.CurrentSessionHandle);
+
+    private void OnMediaOutputSettingsRequested(string? udid, ulong sessionHandle)
+    {
+        if (_mediaOutputSettingsWindow is not null)
+        {
+            _mediaOutputSettingsWindow.Activate();
+            _mediaOutputSettingsWindow.Focus();
+            return;
+        }
+        var window = new MediaOutputSettingsWindow(_viewModel)
+        {
+            Owner = this,
+        };
+        _mediaOutputSettingsWindow = window;
+        window.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_mediaOutputSettingsWindow, window))
+            {
+                _mediaOutputSettingsWindow = null;
+            }
+        };
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_output_window_opened",
+            ("device", AppLog.Device(udid)),
+            ("handle", AppLog.Handle(sessionHandle))));
+        window.Show();
+    }
+
+    private void OnDeviceSessionHandleChanged(string udid, ulong sessionHandle)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(() =>
+                OnDeviceSessionHandleChanged(udid, sessionHandle));
+            return;
+        }
+        if (IsTrayMode && sessionHandle != 0) QueueTrayProjection(udid, sessionHandle);
+        if (_projectionSettingsWindow is not null &&
+            DeviceViewModel.UdidEquals(_projectionSettingsUdid, udid) &&
+            _projectionSettingsSessionHandle != sessionHandle)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "projection_settings_session_invalidated",
+                ("device", AppLog.Device(udid)),
+                ("old_handle", AppLog.Handle(_projectionSettingsSessionHandle)),
+                ("new_handle", AppLog.Handle(sessionHandle))));
+            _projectionSettingsWindow.Close();
+        }
+    }
+
+    private void OnDeviceProtectionStateChanged(string udid,
+        ProtectedContentPresentation presentation)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(() =>
+                OnDeviceProtectionStateChanged(udid, presentation));
+            return;
+        }
+        if (!presentation.IsProtected)
+        {
+            if (DeviceViewModel.UdidEquals(_protectedContentNoticeUdid, udid))
+            {
+                _protectedContentNoticeWindow?.UpdatePresentation(presentation);
+            }
+            return;
+        }
+        if (!DeviceViewModel.UdidEquals(_viewModel.SelectedDevice?.Udid, udid))
+            return;
+        if (_protectedContentNoticeWindow is null)
+        {
+            _protectedContentNoticeUdid = udid;
+            _protectedContentNoticeWindow =
+                new ProtectedContentNoticeWindow(udid, presentation, this);
+            _protectedContentNoticeWindow.Closed += (_, _) =>
+            {
+                _protectedContentNoticeWindow = null;
+                _protectedContentNoticeUdid = null;
+            };
+            _protectedContentNoticeWindow.Show();
+        }
+        else
+        {
+            _protectedContentNoticeWindow.UpdatePresentation(presentation);
+        }
+    }
+
+    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            // Transport stop/recovery can publish from a worker. Revoke old
+            // queued input immediately; mutate capture/owner state only on
+            // the dispatcher which also owns every keyboard ingress.
+            if (e.PropertyName is nameof(MainViewModel.SelectedDevice) or
+                nameof(MainViewModel.CurrentSessionHandle) or nameof(MainViewModel.IsUsbControlEnabled) or
+                nameof(MainViewModel.IsWirelessControlEnabled) or nameof(MainViewModel.UsbControlIsInputEnabled) or
+                nameof(MainViewModel.IsBluetoothControlEnabled) or nameof(MainViewModel.BluetoothControlIsInputEnabled))
+                Interlocked.Increment(ref _keyboardInputGeneration);
+            if (!Dispatcher.HasShutdownStarted)
+                Dispatcher.BeginInvoke(() =>
+                {
+                    if (!_mappingClosing) OnViewModelPropertyChanged(sender, e);
+                });
+            return;
+        }
+        RefreshDeviceHubContext(e.PropertyName);
+        if (e.PropertyName == nameof(MainViewModel.NeedsMediaCastAudioDecode))
+        {
+            if (!_viewModel.NeedsMediaCastAudioDecode) _mediaCastAudioDecoder.Stop();
+            else if (!_mediaCastAudioDecoder.IsRunning) RestartMediaCastAudioAtCurrentPosition();
+        }
+        OnMappingContextChanged(e.PropertyName);
+        if (e.PropertyName == nameof(MainViewModel.HideInterfaceDescriptions)) UpdatePreviewStatusPresentation();
+        // A mode switch also notifies both effective checkbox values. Its
+        // IsLightweightApplicationMode notification applies geometry once.
+        if (e.PropertyName is nameof(MainViewModel.HidePreviewToolbar) or nameof(MainViewModel.HidePreviewStatusBar) &&
+            !_viewModel.IsUpdatingApplicationDisplayMode)
+            ApplyApplicationDisplayMode();
+        if (e.PropertyName == nameof(MainViewModel.BluetoothWindowMouseEnabled))
+        {
+            var enabled = _viewModel.BluetoothWindowMouseEnabled;
+            if (enabled != _bluetoothWindowMouseEnabled)
+            {
+                var target = ActiveInputDeviceUdid;
+                lock (_cursorClipSync)
+                {
+                    Volatile.Write(ref _bluetoothWindowMouseEnabled, enabled);
+                    if (enabled) ClipCursor(IntPtr.Zero);
+                }
+                ResetControlRouteState();
+                MainPreviewHost.ReleasePointerCapture();
+                _secondaryMirrors.ReleasePointerCapture(target);
+                _secondaryMirrors.SetBluetoothWindowMouseEnabled(enabled);
+                if (IsBluetoothControlActiveFor(target))
+                    _ = _viewModel.SendBluetoothMouseAsync(0, 0, expectedTargetDeviceUdid: target);
+                ApplyBluetoothControlInputState(activateIndependentWindow: false);
+            }
+        }
+        if (_viewModel.SetupActive) return;
+        if (e.PropertyName == nameof(MainViewModel.IsTrayApplicationMode))
+            Dispatcher.BeginInvoke(ApplyTrayMode);
+        if (e.PropertyName is nameof(MainViewModel.IsLightweightApplicationMode) or
+            nameof(MainViewModel.IsCapturing) or
+            nameof(MainViewModel.IsMediaCasting) or
+            nameof(MainViewModel.IsMediaCastSelected) or
+            nameof(MainViewModel.SourceVideoWidth) or
+            nameof(MainViewModel.SourceVideoHeight))
+        {
+            if (e.PropertyName != nameof(MainViewModel.IsLightweightApplicationMode) &&
+                !HasLightweightWorkspacePanels)
+                _lightweightWidthNeedsFit = true;
+            ApplyApplicationDisplayMode();
+        }
+        if (e.PropertyName == nameof(MainViewModel.SelectedDevice) && _activeControlWindow == 0)
+            FocusControlDevice(_viewModel.SelectedDevice?.Udid, 0);
+        if (e.PropertyName is nameof(MainViewModel.IsBluetoothControlEnabled) or
+            nameof(MainViewModel.BluetoothControlIsConnected) or
+            nameof(MainViewModel.BluetoothControlIsInputEnabled) or
+            nameof(MainViewModel.BluetoothControlTargetUdid) or
+            nameof(MainViewModel.SelectedDevice) or
+            nameof(MainViewModel.IsUsbControlEnabled) or
+            nameof(MainViewModel.UsbControlIsInputEnabled) or
+            nameof(MainViewModel.CanToggleUsbControl))
+        {
+            ApplyBluetoothControlInputState(activateIndependentWindow: false);
+        }
+        if (e.PropertyName == nameof(MainViewModel.AdvancedSettingsVisibility) &&
+            _viewModel.AdvancedSettingsVisibility == Visibility.Visible)
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Loaded,
+                () =>
+                {
+                    RestoreSettingsCategory("projection");
+                    AdvancedSettingsCard.BringIntoView();
+                });
+        }
+
+        if ((e.PropertyName == nameof(MainViewModel.IsCapturing) && !_viewModel.IsCapturing) ||
+            (e.PropertyName == nameof(MainViewModel.IsAudioOnlyAirPlay) &&
+             _viewModel.IsAudioOnlyAirPlay) ||
+            (e.PropertyName == nameof(MainViewModel.IsVideoProtected) &&
+             _viewModel.IsVideoProtected))
+            MainPreviewHost.SetPresentationVisible(false);
+
+        // Width is raised before height as one atomic status update. Listening
+        // to the final height notification avoids resizing twice per frame-
+        // format/orientation change.
+        if (e.PropertyName is nameof(MainViewModel.SourceVideoHeight) or
+            nameof(MainViewModel.SelectedDevice) or nameof(MainViewModel.SelectedModel) or
+            nameof(MainViewModel.CurrentSessionHandle) or
+            nameof(MainViewModel.IsAudioOnlyAirPlay) or
+            nameof(MainViewModel.IsVideoProtected))
+        {
+            if (e.PropertyName == nameof(MainViewModel.SelectedDevice))
+            {
+                if (_protectedContentNoticeWindow is not null &&
+                    !DeviceViewModel.UdidEquals(_protectedContentNoticeUdid,
+                        _viewModel.SelectedDevice?.Udid))
+                    _protectedContentNoticeWindow.Close();
+                if (_projectionSettingsWindow is not null &&
+                    !DeviceViewModel.UdidEquals(_projectionSettingsUdid,
+                        _viewModel.SelectedDevice?.Udid))
+                    _projectionSettingsWindow.Close();
+            }
+            else if (e.PropertyName == nameof(MainViewModel.CurrentSessionHandle))
+            {
+                var currentHandle = _viewModel.CurrentSessionHandle;
+                if (_projectionSettingsWindow is not null &&
+                    _projectionSettingsSessionHandle != currentHandle)
+                    _projectionSettingsWindow.Close();
+            }
+            _secondaryMirrors.UpdateDevice(
+                _viewModel.SelectedDevice,
+                _viewModel.SourceVideoWidth,
+                _viewModel.SourceVideoHeight);
+            if (e.PropertyName is nameof(MainViewModel.SelectedDevice) or
+                nameof(MainViewModel.CurrentSessionHandle) or
+                nameof(MainViewModel.IsAudioOnlyAirPlay) or
+                nameof(MainViewModel.IsVideoProtected))
+                QueueMainPreviewHostSync();
+        }
+        else if (e.PropertyName == nameof(MainViewModel.IsCapturing))
+            QueueMainPreviewHostSync();
+    }
+
+    private void ApplyBluetoothControlInputState(
+        bool activateIndependentWindow = true)
+    {
+        var controlActive = IsBluetoothControlActive;
+        var absoluteWindowMouseActive = controlActive && _bluetoothWindowMouseEnabled &&
+            _viewModel.BluetoothUsesAbsoluteMouse;
+        if (absoluteWindowMouseActive && !_absoluteWindowMouseActive)
+        {
+            // A Windows drag can be in progress when Bluetooth becomes ready.
+            // Only a new button-down on the picture can start an iPad drag.
+            _windowBluetoothPointerInside = false;
+            _controlButtons = 0;
+            _controlWheelRemainder = 0;
+            _mouseShortcutButtons.Clear();
+            Interlocked.Increment(ref _windowBluetoothPointerGeneration);
+        }
+        _absoluteWindowMouseActive = absoluteWindowMouseActive;
+        var captureMouse = IsBluetoothMouseCaptured;
+        var usbControlActive = IsUsbControlActive;
+        var usbControlConnected = _viewModel.IsUsbControlTarget(ActiveInputDeviceUdid);
+        // Keyboard ownership follows the active device, including independent
+        // USB/wireless previews. usbControlActive only describes the main host.
+        if ((controlActive || usbControlConnected) && !IsKeyboardMappingInputModeActive)
+            TryEnterDirectKeyboardInputMode();
+        Volatile.Write(ref _activeUsbInputEnabled, usbControlConnected);
+        MainPreviewHost.CapturePointerInput =
+            (controlActive || usbControlActive) && _activeControlWindow == 0;
+        MainPreviewHost.CaptureTouchInput = usbControlActive && _activeControlWindow == 0;
+        MainPreviewHost.BluetoothWindowMouseEnabled = _bluetoothWindowMouseEnabled &&
+            controlActive && !usbControlActive && _activeControlWindow == 0;
+        if (activateIndependentWindow && IsActive && (controlActive || usbControlActive) && _activeControlWindow == 0)
+        {
+            // Explicitly focus the native preview whenever any main-window
+            // control route becomes active. The preview is a native child HWND,
+            // so normal WPF key bubbling is only a fallback path.
+            MainPreviewHost.Focus();
+        }
+        // USB touch control sends touch coordinates and must leave the
+        // Windows pointer visible, including while an independent preview
+        // owns the active control route.
+        SetWindowsCursorHidden(captureMouse && !usbControlConnected);
+        ReconcileKeyboardHook();
+        // Keep relative mouse input for independent previews as well: clipped
+        // WM_MOUSEMOVE coordinates stop changing at the window boundary.
+        RegisterRawInput(captureMouse,
+            (controlActive || usbControlActive) && _activeControlWindow == 0 &&
+            !IsKeyboardMappingInputModeActive);
+        if (controlActive && _activeControlWindow != 0)
+        {
+            // Native independent previews only forward input while foreground.
+            if (activateIndependentWindow)
+                _secondaryMirrors.Activate(_activeControlUdid);
+        }
+        else if (!controlActive && !usbControlActive && !usbControlConnected)
+            ClearBluetoothControlInputState();
+        if (captureMouse)
+        {
+            ClipWindowsCursorToControlSurface();
+            _cursorClipWatchdogTimer.Change(CursorClipWatchdogInterval,
+                CursorClipWatchdogInterval);
+        }
+        else
+            _cursorClipWatchdogTimer.Change(Timeout.Infinite, Timeout.Infinite);
+        RefreshDeviceHotkeys();
+    }
+
+    private static readonly TimeSpan CursorClipWatchdogInterval =
+        TimeSpan.FromMilliseconds(200);
+    private bool _activeUsbInputEnabled;
+
+    private void ClearBluetoothControlInputState()
+    {
+        UnregisterDeviceHotkeys();
+        // Hiding a native window or losing its Bluetooth route does not restore
+        // process-wide cursor, keyboard, raw-input, or clipping state by itself.
+        _cursorClipWatchdogTimer.Change(Timeout.Infinite, Timeout.Infinite);
+        MainPreviewHost.CapturePointerInput = false;
+        MainPreviewHost.BluetoothWindowMouseEnabled = false;
+        MainPreviewHost.ReleasePointerCapture();
+        _secondaryMirrors.ReleasePointerCapture(_activeControlUdid);
+        MainPreviewHost.SuppressLegacyMouseButtons = false;
+        SetWindowsCursorHidden(false);
+        ReconcileKeyboardHook();
+        RegisterRawInput(false, false);
+        ClipCursor(IntPtr.Zero);
+        ResetControlRouteState();
+        LeaveDirectKeyboardInputMode();
+        foreach (var udid in _usbTouchStates.Keys.ToArray())
+            _ = HandleUsbPointerInputAsync(new Controls.PreviewPointerEventArgs(
+                Controls.PreviewPointerKind.Reset, 0, 0, 0, 0), udid);
+        ResetAllPreviewTouches();
+    }
+
+    private void ApplyApplicationDisplayMode()
+    {
+        _completeResizePreviewWidth = 0;
+        if (_isFullScreen || !_viewModel.IsLightweightApplicationMode)
+            MainContentGrid.ClearValue(WidthProperty);
+        if (_isFullScreen)
+        {
+            // Compact mode pins Width, MinWidth and MaxWidth to the portrait
+            // frame. Release all three so the preview can fill the monitor;
+            // leaving full screen reapplies the compact frame policy.
+            PreviewPanel.BeginAnimation(WidthProperty, null);
+            PreviewPanel.ClearValue(WidthProperty);
+            PreviewPanel.ClearValue(MinWidthProperty);
+            PreviewPanel.ClearValue(MaxWidthProperty);
+            CenterColumn.MaxWidth = double.PositiveInfinity;
+            PreviewPanel.HorizontalAlignment = HorizontalAlignment.Stretch;
+            return;
+        }
+
+        if (!_viewModel.IsLightweightApplicationMode)
+        {
+            CancelLightweightWindowWidthAnimation();
+            PreviewPanel.ClearValue(WidthProperty);
+            PreviewPanel.ClearValue(MinWidthProperty);
+            PreviewPanel.ClearValue(MaxWidthProperty);
+            CenterColumn.MaxWidth = double.PositiveInfinity;
+            PreviewPanel.ClearValue(HorizontalAlignmentProperty);
+            PreviewPanel.SetResourceReference(Panel.BackgroundProperty,
+                "PreviewChromeBrush");
+            PreviewPanel.BorderThickness = new Thickness(1);
+            PreviewPanel.CornerRadius = new CornerRadius(16);
+            PreviewPanel.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+            MainPreviewHost.SetDeviceCornerProfile(DeviceCornerProfile.Rectangular,
+                enabled: false);
+            UpdateCompleteWorkspaceMinimumWidth();
+            if (_lightweightModeApplied && !_isWindowMaximized)
+            {
+                SizeToContent = SizeToContent.Manual;
+                if (_completeModeWidth >= MinWidth) Width = _completeModeWidth;
+            }
+            _lightweightModeApplied = false;
+            _lightweightWidthNeedsFit = false;
+            return;
+        }
+
+        if (!_lightweightModeApplied)
+        {
+            _completeModeWidth = ActualWidth > 0 ? ActualWidth : Width;
+            _lightweightModeApplied = true;
+            _lightweightWidthNeedsFit = true;
+        }
+        PreviewPanel.MinWidth = 0;
+        PreviewPanel.ClearValue(WidthProperty);
+        if (HasLightweightVideoPresentation)
+        {
+            // Compact mode lets the native preview own the device outline;
+            // the WPF frame must not leave a black strip above the clipped
+            // child HWND.
+            PreviewPanel.Background = Brushes.Transparent;
+            PreviewPanel.BorderThickness = new Thickness(0);
+            PreviewPanel.CornerRadius = new CornerRadius(0);
+            PreviewPanel.BorderBrush = Brushes.Transparent;
+        }
+        else
+        {
+            PreviewPanel.SetResourceReference(Panel.BackgroundProperty,
+                "PreviewChromeBrush");
+            PreviewPanel.BorderThickness = new Thickness(1);
+            PreviewPanel.CornerRadius = new CornerRadius(16);
+            PreviewPanel.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+        }
+        UpdateMainPreviewCornerProfile();
+        ApplyLightweightPreviewFramePolicy();
+        if (_isWindowMaximized)
+            return;
+        SizeToContent = SizeToContent.Manual;
+        if (HasLightweightVideoPresentation && !HasLightweightContentDimensions)
+        {
+            // Keep the stable pre-capture geometry until the decoder has a
+            // real source size. The first QuickTime frames are sensitive to
+            // repeated host HWND resizes during USB re-enumeration.
+            _lightweightWidthNeedsFit = true;
+            return;
+        }
+        if (HasLightweightWorkspacePanels)
+        {
+            _lightweightWidthNeedsFit = false;
+            QueueInitialLightweightWorkspaceFit();
+        }
+        else
+            QueueLightweightPreviewWidth();
+    }
+
+    private void QueueLightweightPreviewWidth()
+    {
+        if (HasLightweightWorkspacePanels)
+        {
+            _lightweightWidthNeedsFit = false;
+            return;
+        }
+        if (_workspaceSurfaceAnimationActive) return;
+        if (_lightweightPreviewWidthQueued) return;
+        _lightweightPreviewWidthQueued = true;
+        Dispatcher.BeginInvoke(DispatcherPriority.Render, () =>
+        {
+            _lightweightPreviewWidthQueued = false;
+            // This request may have been queued before a sidebar click. The
+            // replacement transition now owns preview and window geometry.
+            if (_workspaceTransition?.IsRunning == true ||
+                _workspaceSurfaceAnimationActive || HasLightweightWorkspacePanels) return;
+            if (!_viewModel.IsLightweightApplicationMode || _isFullScreen ||
+                _isWindowMaximized)
+            {
+                PreviewPanel.ClearValue(WidthProperty);
+                return;
+            }
+            if (CenterColumn.ActualWidth <= 0)
+            {
+                _lightweightWidthNeedsFit = true;
+                return;
+            }
+
+            // CenterPanel is the resizable grid column. Subtracting the preview
+            // itself would count unused center whitespace as chrome and raise
+            // MinWidth to the current window width.
+            var currentWindowWidth = GetLightweightCurrentWindowWidth();
+            var chromeWidth = Math.Max(0, currentWindowWidth - CenterColumn.ActualWidth);
+            var maximumWindowWidth = GetLightweightMaximumWindowWidth();
+            var maximumPreviewWidth = Math.Max(1, maximumWindowWidth -
+                chromeWidth);
+            var hasContentPreviewWidth = TryGetLightweightContentPreviewWidth(
+                maximumPreviewWidth, out var contentPreviewWidth);
+            var aspect = _viewModel.SourceVideoWidth != 0 &&
+                _viewModel.SourceVideoHeight != 0
+                ? (double)_viewModel.SourceVideoWidth / _viewModel.SourceVideoHeight
+                : LightweightDefaultPreviewAspect;
+            var previewHeight = Math.Max(520, PreviewPanel.ActualHeight);
+            var preferredPreviewWidth = hasContentPreviewWidth
+                ? contentPreviewWidth
+                : Math.Max(LightweightMinimumPreviewWidth,
+                    Math.Round(previewHeight * aspect));
+            var width = Math.Min(preferredPreviewWidth,
+                maximumPreviewWidth);
+            var minimumWindowWidth = Math.Max(LightweightMinimumWindowWidth,
+                chromeWidth + (hasContentPreviewWidth
+                    ? contentPreviewWidth
+                    : LightweightMinimumPreviewWidth));
+            var targetMinimumWindowWidth = Math.Min(minimumWindowWidth,
+                maximumWindowWidth);
+            _lightweightTargetMinWidth = targetMinimumWindowWidth;
+            if (MinWidth > targetMinimumWindowWidth ||
+                ActualWidth >= targetMinimumWindowWidth)
+                MinWidth = targetMinimumWindowWidth;
+            ApplyLightweightPreviewFramePolicy(useNormalPortraitFrame: false,
+                hasContentPreviewWidth ? width : null);
+            if (_lightweightWidthNeedsFit)
+            {
+                _lightweightWidthNeedsFit = false;
+                var targetWindowWidth = Math.Clamp(chromeWidth + width,
+                    targetMinimumWindowWidth, maximumWindowWidth);
+                if (hasContentPreviewWidth)
+                    SetLightweightWindowWidthImmediately(targetWindowWidth);
+                else
+                    AnimateLightweightWindowWidth(targetWindowWidth);
+            }
+        });
+    }
+
+    private void ApplyLightweightPreviewFramePolicy(
+        bool? useNormalPortraitFrame = null, double? contentPreviewWidth = null)
+    {
+        if (!_viewModel.IsLightweightApplicationMode || _isFullScreen) return;
+        double requestedContentPreviewWidth;
+        if (contentPreviewWidth is { } explicitContentPreviewWidth)
+            requestedContentPreviewWidth = explicitContentPreviewWidth;
+        else if (!TryGetLightweightContentPreviewWidth(double.PositiveInfinity,
+            out requestedContentPreviewWidth))
+            requestedContentPreviewWidth = 0;
+        if (requestedContentPreviewWidth > 0)
+        {
+            ApplyLightweightPreviewWidthLimit(requestedContentPreviewWidth);
+            return;
+        }
+        var canUseNormalPortraitFrame = useNormalPortraitFrame ??
+            CanUseNormalPortraitPreviewFrame();
+        // Preview chrome owns the complete center column unless the current
+        // workspace can fit the requested 340 DIP portrait frame.
+        if (!canUseNormalPortraitFrame)
+        {
+            ApplyLightweightPreviewWidthLimit(double.PositiveInfinity);
+            return;
+        }
+
+        ApplyLightweightPreviewWidthLimit(LightweightNormalPortraitPreviewWidth);
+    }
+
+    private void ApplyLightweightPreviewWidthLimit(double maximumWidth)
+    {
+        PreviewPanel.MinWidth = 0;
+        SetLightweightPreviewMaximumWidth(maximumWidth);
+    }
+
+    private bool ShouldCenterLightweightPreview => !HasLightweightWorkspacePanels &&
+        !_workspaceSurfaceAnimationActive && _workspaceTransition?.IsRunning != true &&
+        GetLightweightElementWidth(LeftPanelHost) <= 0 && GetLightweightElementWidth(ControlPanel) <= 0;
+
+    private void SetLightweightPreviewMaximumWidth(double maximumWidth)
+    {
+        // The preview and its grid slot must share their width limit. Capping
+        // only the border leaves invisible center space before the right card.
+        var center = ShouldCenterLightweightPreview;
+        PreviewViewportSlot.CenterContent = center;
+        CenterColumn.MaxWidth = center ? double.PositiveInfinity : maximumWidth;
+        if (PreviewPanel.MaxWidth != maximumWidth)
+        {
+            PreviewPanel.MaxWidth = maximumWidth;
+            // The child's natural desired width can stay unchanged (e.g. a
+            // native host). The slot still has a new cap and must arrange it.
+            PreviewViewportSlot.InvalidateArrange();
+        }
+    }
+
+    private void OnPreviewPanelSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        // SizeChanged has the newly arranged height. Update its width cap now
+        // so WPF can arrange it before the same frame is presented. Do not fit
+        // the outer window or wait for another queued layout notification.
+        if (e.HeightChanged && _viewModel.IsLightweightApplicationMode &&
+            HasLightweightVideoPresentation && HasLightweightContentDimensions)
+            RefreshLightweightPreviewViewport();
+    }
+
+    private bool TryGetLightweightContentPreviewWidth(double maximumWidth,
+        out double previewWidth)
+    {
+        previewWidth = 0;
+        if (!HasLightweightVideoPresentation || _viewModel.SourceVideoWidth == 0 ||
+            _viewModel.SourceVideoHeight == 0 || maximumWidth <= 0) return false;
+        var aspect = (double)_viewModel.SourceVideoWidth /
+            _viewModel.SourceVideoHeight;
+        var previewHeight = PreviewPanel.ActualHeight > 0
+            ? PreviewPanel.ActualHeight
+            : Math.Max(520, ActualHeight);
+        if (!double.IsFinite(aspect) || aspect <= 0 ||
+            !double.IsFinite(previewHeight) || previewHeight <= 0) return false;
+        previewWidth = Math.Min(maximumWidth,
+            Math.Max(1, Math.Round(previewHeight * aspect)));
+        return true;
+    }
+
+    private bool CanUseNormalPortraitPreviewFrame()
+    {
+        var showLeftPanel = _leftWorkspacePanel != LeftWorkspacePanel.None;
+        var showSettings = IsRightWorkspacePanelVisible;
+        if (!showLeftPanel && !showSettings) return false;
+        var targetSideWidth = (showLeftPanel ? WorkspaceDeviceWidth + 18 : 0) +
+            (showSettings ? WorkspaceRightWidth + 18 : 0);
+        var chromeWidth = GetLightweightFixedChromeWidth(
+            GetLightweightCurrentWindowWidth());
+        return GetLightweightMaximumWindowWidth() >= chromeWidth +
+            targetSideWidth + LightweightNormalPortraitPreviewWidth;
+    }
+
+    private void AnimateLightweightWindowWidth(double targetWidth,
+        bool preserveCenterWidth = false)
+    {
+        if (!double.IsFinite(targetWidth) || targetWidth <= 0) return;
+        if (!preserveCenterWidth) ReleaseLightweightCenterWidth();
+        var handle = new WindowInteropHelper(this).Handle;
+        if (!IsLoaded || handle == 0 || !GetWindowRect(handle, out var bounds))
+        {
+            Width = targetWidth;
+            CompleteWorkspaceSurfaceAnimation();
+            if (preserveCenterWidth) ReleaseLightweightCenterWidth();
+            return;
+        }
+
+        var dpi = GetDpiForWindow(handle);
+        var scale = (dpi == 0 ? 96d : dpi) / 96d;
+        var targetPixels = Math.Max(1, (int)Math.Round(targetWidth * scale));
+        var currentPixels = Math.Max(1, bounds.Right - bounds.Left);
+        if (!preserveCenterWidth)
+        {
+            _lightweightWindowStartX = bounds.Left;
+            _lightweightWindowTargetX = bounds.Left;
+        }
+        _lightweightWindowTopPixels = bounds.Top;
+        if (Math.Abs(currentPixels - targetPixels) <= 1 &&
+            _lightweightWindowStartX == _lightweightWindowTargetX &&
+            !_workspaceSurfaceAnimationActive)
+        {
+            Width = targetWidth;
+            CompleteWorkspaceSurfaceAnimation();
+            if (preserveCenterWidth) ReleaseLightweightCenterWidth();
+            return;
+        }
+
+        _lightweightWindowWidthStartPixels = currentPixels;
+        _lightweightWindowWidthTargetPixels = targetPixels;
+        _lightweightWindowHeightPixels = Math.Max(1, bounds.Bottom - bounds.Top);
+        _lightweightWindowWidthTargetDips = targetWidth;
+        if (preserveCenterWidth) _lightweightCenterWidthLocked = true;
+        _lightweightWindowLastAppliedWidthPixels = currentPixels;
+        _lightweightWindowLastAppliedX = bounds.Left;
+        _workspaceAnimationWindow = handle;
+        _lightweightWindowAnimationActive = true;
+        StartWorkspaceTransition();
+    }
+
+    private void CancelLightweightWindowWidthAnimation(bool preserveLayout = false)
+    {
+        if (!preserveLayout) SettleWorkspaceForEnvironmentChange();
+        // Frame values are ordinary local values. Stopping the sole progress
+        // clock preserves the exact current widths/opacity for retargeting.
+        _workspaceTransition?.Stop();
+        _workspacePreviewAnimationActive = false;
+        _lightweightWindowAnimationActive = false;
+        _workspaceAnimationWindow = 0;
+        _workspaceSurfaceAnimationActive = false;
+        if (!preserveLayout)
+        {
+            SetLightweightCenterColumnFill();
+            ReleaseLightweightCenterWidth();
+        }
+    }
+    private void ApplyLightweightWindowAnimationFrame(nint handle, double progress,
+        bool force = false)
+    {
+        var eased = progress;
+        var width = (int)Math.Round(_lightweightWindowWidthStartPixels +
+            (_lightweightWindowWidthTargetPixels - _lightweightWindowWidthStartPixels) * eased);
+        var x = (int)Math.Round(_lightweightWindowStartX +
+            (_lightweightWindowTargetX - _lightweightWindowStartX) * eased);
+
+        if (!force && width == _lightweightWindowLastAppliedWidthPixels &&
+            x == _lightweightWindowLastAppliedX)
+            return;
+
+        _applyingWorkspaceWindowBounds = true;
+        try
+        {
+            if (handle != 0)
+                _ = SetWindowPos(handle, 0, x, _lightweightWindowTopPixels, width,
+                    _lightweightWindowHeightPixels, SwpNoZOrder | SwpNoActivate | SwpNoCopyBits);
+        }
+        finally { _applyingWorkspaceWindowBounds = false; }
+        _lightweightWindowLastAppliedWidthPixels = width;
+        _lightweightWindowLastAppliedX = x;
+    }
+
+    private void SynchronizeLightweightWindowPosition()
+    {
+        if (_lightweightWindowStartX == _lightweightWindowTargetX) return;
+        var handle = new WindowInteropHelper(this).Handle;
+        var dpi = handle == 0 ? 96u : GetDpiForWindow(handle);
+        var scale = (dpi == 0 ? 96d : dpi) / 96d;
+        Left = _lightweightWindowTargetX / scale;
+        Top = _lightweightWindowTopPixels / scale;
+    }
+
+    private void ApplyWorkspaceSurfaceWidths(double progress)
+    {
+        if (!_workspaceSurfaceAnimationActive) return;
+        var left = Interpolate(_workspaceLeftSurfaceStartWidth, _workspaceLeftSurfaceTargetWidth, progress);
+        var right = Interpolate(_workspaceRightSurfaceStartWidth, _workspaceRightSurfaceTargetWidth, progress);
+        var leftGap = Interpolate(_workspaceLeftGapStartWidth, _workspaceLeftGapTargetWidth, progress);
+        var rightGap = Interpolate(_workspaceRightGapStartWidth, _workspaceRightGapTargetWidth, progress);
+        if (LeftPanelHost.Width != left) LeftPanelHost.Width = left;
+        if (ControlPanel.Width != right) ControlPanel.Width = right;
+        if (LeftGapColumn.Width.Value != leftGap) LeftGapColumn.Width = new GridLength(leftGap);
+        if (RightGapColumn.Width.Value != rightGap) RightGapColumn.Width = new GridLength(rightGap);
+        UpdateWorkspaceViewportConstraints();
+    }
+
+    private void CompleteWorkspaceSurfaceAnimation()
+    {
+        if (!_workspaceSurfaceAnimationActive) return;
+        ApplyWorkspaceSurfaceWidths(1);
+        _workspaceSurfaceAnimationActive = false;
+        if (_workspaceLeftSurfaceTargetWidth == 0) LeftPanelHost.Visibility = Visibility.Collapsed;
+        if (_workspaceRightSurfaceTargetWidth == 0) ControlPanel.Visibility = Visibility.Collapsed;
+        if (_viewModel.IsLightweightApplicationMode)
+        {
+            SetLightweightCenterColumnFill();
+            if (_lightweightTargetMinWidth > 0) MinWidth = _lightweightTargetMinWidth;
+            ApplyLightweightPreviewFramePolicy();
+            if (_lightweightWidthNeedsFit) RequestLightweightWindowFit();
+        }
+    }
+    private static double Interpolate(double from, double to, double progress) =>
+        from + (to - from) * progress;
+
+    private void LockLightweightCenterWidth()
+    {
+        if (CenterColumn.ActualWidth <= 0) return;
+        CenterColumn.Width = new GridLength(CenterColumn.ActualWidth);
+        _lightweightCenterWidthLocked = true;
+    }
+
+    private void ReleaseLightweightCenterWidth()
+    {
+        if (!_lightweightCenterWidthLocked) return;
+        SetLightweightCenterColumnFill();
+        _lightweightCenterWidthLocked = false;
+    }
+
+    private void SetLightweightCenterColumnFill() =>
+        CenterColumn.Width = new GridLength(1, GridUnitType.Star);
+
+    private bool HasLightweightVideoPresentation => _viewModel.IsCapturing ||
+        (_mediaCastActive && _viewModel.IsMediaCastSelected);
+
+    private void UpdateMainPreviewCornerProfile()
+    {
+        var useDeviceOutline = _viewModel.IsLightweightApplicationMode &&
+            !_isFullScreen && HasLightweightVideoPresentation &&
+            !_viewModel.IsMediaCastSelected;
+        var profile = useDeviceOutline
+            ? DeviceCornerProfileResolver.Resolve(_viewModel.SelectedDevice?.ProductType,
+                _viewModel.SourceVideoWidth, _viewModel.SourceVideoHeight)
+            : DeviceCornerProfile.Rectangular;
+        MainPreviewHost.SetDeviceCornerProfile(profile, useDeviceOutline);
+
+        var session = _viewModel.CurrentSessionHandle;
+        // A session can be rendered by either the main child HWND or an
+        // independent top-level HWND. The session-wide setter updates every
+        // renderer, so never let a main-window mode switch overwrite the
+        // independent window's per-HWND device outline.
+        var independentWindowOpen = _secondaryMirrors.IsOpen(_viewModel.SelectedDevice);
+        if (session != 0 && !independentWindowOpen)
+            _ = NativeCore.SetDeviceCornerProfile(session,
+                profile.IsRounded ? profile.RadiusRatio : 0, profile.CurveExponent);
+    }
+
+    private bool HasLightweightContentDimensions =>
+        _viewModel.SourceVideoWidth != 0 && _viewModel.SourceVideoHeight != 0;
+
+    private bool HasLightweightWorkspacePanels =>
+        _leftWorkspacePanel != LeftWorkspacePanel.None || IsRightWorkspacePanelVisible;
+
+    private double GetLightweightFixedChromeWidth(double currentWindowWidth)
+    {
+        if (RootLayout.ActualWidth > 0)
+            return Math.Max(0, currentWindowWidth - RootLayout.ActualWidth);
+
+        var contentWidth = GetLightweightElementWidth(LeftPanelHost) +
+            GetLightweightColumnWidth(LeftGapColumn) +
+            Math.Max(0, CenterColumn.ActualWidth) +
+            GetLightweightColumnWidth(RightGapColumn) +
+            GetLightweightElementWidth(ControlPanel);
+        return Math.Max(0, currentWindowWidth - contentWidth);
+    }
+
+    private double GetLightweightMaximumWindowWidth()
+    {
+        if (!TryGetLightweightWorkArea(out var workArea, out var scale))
+            return double.PositiveInfinity;
+        var workWidth = workArea.Right - workArea.Left;
+        return Math.Max(1, workWidth / scale - LightweightWorkAreaInset);
+    }
+
+    private bool TryGetLightweightWorkArea(out NativeRect workArea,
+        out double scale)
+    {
+        workArea = default;
+        var handle = new WindowInteropHelper(this).Handle;
+        var monitor = MonitorFromWindow(handle, MonitorDefaultToNearest);
+        var monitorInfo = new MonitorInfo
+        {
+            Size = (uint)Marshal.SizeOf<MonitorInfo>(),
+        };
+        if (monitor == 0 || !GetMonitorInfoW(monitor, ref monitorInfo))
+        {
+            scale = 1;
+            return false;
+        }
+        var dpi = GetDpiForWindow(handle);
+        scale = (dpi == 0 ? 96d : dpi) / 96d;
+        workArea = monitorInfo.WorkArea;
+        return true;
+    }
+
+    private double GetLightweightCurrentWindowWidth()
+    {
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle != 0 && GetWindowRect(handle, out var bounds))
+        {
+            var dpi = GetDpiForWindow(handle);
+            var scale = (dpi == 0 ? 96d : dpi) / 96d;
+            return Math.Max(1, bounds.Right - bounds.Left) / scale;
+        }
+        return Math.Max(1, ActualWidth);
+    }
+
+    private async Task SwitchBluetoothControlForSelectionChangeAsync()
+    {
+        Interlocked.Exchange(ref _bluetoothRouteChanging, 1);
+        await _bluetoothRouteGate.WaitAsync();
+        try
+        {
+            var targetUdid = _viewModel.SelectedDevice?.Udid;
+            if (_activeControlWindow == 0 && _viewModel.IsBluetoothControlEnabled &&
+                !DeviceViewModel.UdidEquals(_viewModel.BluetoothControlTargetUdid,
+                    targetUdid))
+                await _viewModel.SwitchBluetoothControlTargetAsync(targetUdid);
+        }
+        finally
+        {
+            ResetControlRouteState();
+            Volatile.Write(ref _bluetoothRouteChanging, 0);
+            _bluetoothRouteGate.Release();
+        }
+    }
+
+    private void ResetControlRouteState()
+    {
+        ResetKeyboardOwnership();
+        _windowBluetoothPointerInside = false;
+        _controlPointerInitialized = false;
+        _lastControlSourceX = 0;
+        _lastControlSourceY = 0;
+        _lastControlGeometryWidth = 0;
+        _lastControlGeometryHeight = 0;
+        _lastControlGeometryRotation = 0;
+        _controlRemainderX = 0;
+        _controlRemainderY = 0;
+        _controlWheelRemainder = 0;
+        _controlButtons = 0;
+        lock (_controlQueueSync)
+        {
+            Interlocked.Increment(ref _windowBluetoothPointerGeneration);
+            _windowMouseButtonReports.Clear();
+            _pendingControlDx = 0;
+            _pendingControlDy = 0;
+            _pendingControlWheel = 0;
+            _pendingControlButtons = 0;
+            _pendingControlStateDirty = false;
+            _pendingControlMotionAt = 0;
+        }
+        _controlKeyboardUsages.Clear();
+        _controlModifierKeys.Clear();
+        _controlKeyboardModifiers = 0;
+        _pasteVPending = false;
+        StopControlPointerTimer();
+    }
+
+    private void OnDevicesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        // Background discovery in tray mode must not open onboarding dialogs
+        // or rearrange the hidden workspace. Control setup remains available
+        // from the independent preview when the user requests it.
+        if (IsTrayMode)
+        {
+            if (e.NewItems is not null)
+                foreach (var device in e.NewItems.OfType<DeviceViewModel>())
+                {
+                    var handle = _viewModel.GetDeviceSessionHandle(device.Udid);
+                    if (handle != 0) QueueTrayProjection(device.Udid, handle);
+                }
+            return;
+        }
+        if (e.Action == NotifyCollectionChangedAction.Add && e.NewItems is not null)
+        {
+            foreach (var device in e.NewItems.OfType<DeviceViewModel>())
+                ShowDeviceProfileGuidance(device);
+        }
+
+        // A source panel is useful once there is a choice. Open it exactly
+        // when a new source is added; refreshes and removals must not override
+        // the user's current panel choice.
+        if (e.Action != NotifyCollectionChangedAction.Add ||
+            e.NewItems is null || e.NewItems.Count == 0 || _viewModel.Devices.Count <= 1 ||
+            _leftWorkspacePanel == LeftWorkspacePanel.Devices)
+            return;
+
+        SetLeftWorkspacePanel(LeftWorkspacePanel.Devices);
+        _viewModel.AddDiagnosticLog(AppLog.Event("workspace_left_panel_auto_opened",
+            ("reason", "device_added"), ("device_count", _viewModel.Devices.Count)));
+    }
+
+    private void ShowDeviceProfileGuidance(DeviceViewModel device)
+    {
+        // Discovery is awaited by the shortcut request. A modal onboarding
+        // dialog here blocks that task until its startup deadline expires.
+        // Cover both cold shortcut startup and requests forwarded to an
+        // already running workspace; setup remains available from its UI.
+        if ((Application.Current as App)?.LaunchOptions.Enabled == true ||
+            _compactLaunchGate.CurrentCount == 0)
+            return;
+        if (device.IsMediaCast || string.IsNullOrWhiteSpace(device.Udid) ||
+            !_deviceProfileGuidanceShown.Add(device.Udid)) return;
+
+        var identityType = device.IsWireless
+            ? DeviceIdentityType.AirPlay : DeviceIdentityType.Wired;
+        if (DeviceBindingManager.Shared.FindByIdentity(identityType, device.Udid) is not null)
+            return;
+
+        var titleKey = device.IsWireless
+            ? "DeviceProfileGuidanceWirelessTitle"
+            : "DeviceProfileGuidanceWiredTitle";
+        var bodyKey = device.IsWireless
+            ? "DeviceProfileGuidanceWirelessBody"
+            : "DeviceProfileGuidanceWiredBody";
+        _viewModel.AddDiagnosticLog(AppLog.Event("device_profile_guidance_shown",
+            ("device", AppLog.Device(device.Udid)),
+            ("transport", device.IsWireless ? "airplay" : "usb")));
+        if (!AppPromptWindow.Confirm(LocalizationService.Get(titleKey),
+                LocalizationService.Get(bodyKey))) return;
+
+        OnNavigateReverseControlClick(this, new RoutedEventArgs());
+    }
+
+    private bool _mainPreviewHostSyncQueued;
+
+    private void QueueMainPreviewHostSync()
+    {
+        if (_mainPreviewHostSyncQueued || _shutdownStarted) return;
+        _mainPreviewHostSyncQueued = true;
+        Dispatcher.BeginInvoke(DispatcherPriority.Render, () =>
+        {
+            _mainPreviewHostSyncQueued = false;
+            if (!_shutdownStarted) SynchronizeMainPreviewHost();
+        });
+    }
+
+    private void SynchronizeMainPreviewHost()
+    {
+        UpdateMainPreviewCornerProfile();
+        var mediaOnMain = _mediaCastActive && _mediaCastPreviewWindow is null &&
+            _viewModel.IsMediaCastSelected;
+        var independentOnMain = !mediaOnMain && !_viewModel.IsMediaCastSelected &&
+            _secondaryMirrors.IsOpen(_viewModel.SelectedDevice);
+        MediaCastSurface.Visibility = mediaOnMain
+            ? Visibility.Visible : Visibility.Collapsed;
+        IndependentPreviewSurface.Visibility = independentOnMain
+            ? Visibility.Visible : Visibility.Collapsed;
+        var visible = !IsTrayMode && !mediaOnMain && !_viewModel.IsMediaCastSelected &&
+            _viewModel.IsCapturing && !_viewModel.IsAudioOnlyAirPlay &&
+            !_viewModel.IsVideoProtected &&
+            _viewModel.CurrentSessionHandle != 0 && !independentOnMain;
+        MainPreviewHost.SetPresentationVisible(visible);
+        if (!visible)
+        {
+            // HwndHost owns native airspace and cannot be covered by the WPF
+            // independent-window notice. Collapsing the host removes that
+            // child HWND from composition until the main preview is restored.
+            MainPreviewHost.Visibility = Visibility.Collapsed;
+            MainPreviewHost.Deactivate();
+            return;
+        }
+
+        MainPreviewHost.ClearValue(VisibilityProperty);
+        MainPreviewHost.Activate();
+        MainPreviewHost.SetPresentationVisible(true);
+    }
+
+    private void OnDeviceVideoSizeChanged(string udid, uint width, uint height) =>
+        _secondaryMirrors.UpdateDevice(udid, width, height);
+
+    private void OnFullScreenClick(object sender, RoutedEventArgs e) => _ = ToggleActiveFullScreenAsync();
+
+    private async Task ToggleActiveFullScreenAsync()
+    {
+        try
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("fullscreen_toggle_begin",
+                ("mode", _viewModel.IsMediaCastSelected ? "media_cast" : "device"),
+                ("independent", _mediaCastPreviewWindow is not null ||
+                    _secondaryMirrors.IsOpen(_viewModel.SelectedDevice))));
+            if (_viewModel.IsMediaCastSelected && _mediaCastPreviewWindow is not null)
+                _mediaCastPreviewWindow.ToggleFullScreen();
+            else if (_secondaryMirrors.IsOpen(_viewModel.SelectedDevice) &&
+                _viewModel.SelectedDevice is { } device)
+                _ = await _secondaryMirrors.ToggleFullScreenAsync(device);
+            else if (IsTrayMode)
+            {
+                if (_viewModel.SelectedDevice is not { } selected) return;
+                await StartTrayProjectionAsync(selected);
+                if (_secondaryMirrors.IsOpen(selected))
+                    _ = await _secondaryMirrors.ToggleFullScreenAsync(selected);
+            }
+            else
+                ToggleFullScreen();
+            UpdateMediaCastFullScreenButton();
+            if (_mediaCastActive) RevealMediaCastControls();
+            _viewModel.AddDiagnosticLog(AppLog.Event("fullscreen_toggle_complete",
+                ("mode", _viewModel.IsMediaCastSelected ? "media_cast" : "device")));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("fullscreen_toggle_failed",
+                ("error", AppLog.Error(error))));
+            _viewModel.AddUiLog(LocalizationService.Format("FullScreenFailedFormat", error.Message));
+        }
+    }
+
+    private void ToggleFullScreen()
+    {
+        if (_isFullScreen)
+        {
+            WindowState = WindowState.Normal;
+            WindowStyle = _restoreWindowStyle;
+            ResizeMode = _restoreResizeMode;
+            Topmost = _restoreTopmost;
+            Left = _restoreBounds.Left;
+            Top = _restoreBounds.Top;
+            Width = _restoreBounds.Width;
+            Height = _restoreBounds.Height;
+            SetNavigationPaneVisible(true);
+            RootNavigation.IsPaneOpen = false;
+            RootLayout.Margin = new Thickness(12, 18, 18, 18);
+            SetFullScreenPreviewBackground(false);
+            HeaderGapRow.Height = new GridLength(18);
+            PreviewPanel.BorderThickness = new Thickness(1);
+            PreviewPanel.CornerRadius = new CornerRadius(16);
+            PreviewPanel.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+            HeaderPanel.Visibility = Visibility.Visible;
+            // Entering full screen applies a temporary local Collapsed value.
+            // Restore the normal visibility rules for both preview bars.
+            EnvironmentPanel.ClearValue(UIElement.VisibilityProperty);
+            StatsPanel.ClearValue(UIElement.VisibilityProperty);
+            ApplyWorkspacePanelState();
+            _isFullScreen = false;
+            WindowState = _restoreWindowState == WindowState.Minimized
+                ? WindowState.Normal
+                : _restoreWindowState;
+            if (_restoreWasWindowMaximized)
+                MaximizeWindow(_windowMaximizeRestoreBounds);
+            else
+                ApplyWindowFramePolicy();
+        }
+        else
+        {
+            _restoreWindowStyle = WindowStyle;
+            _restoreWindowState = WindowState;
+            _restoreResizeMode = ResizeMode;
+            _restoreTopmost = Topmost;
+            _restoreWasWindowMaximized = _isWindowMaximized;
+            _restoreBounds = _isWindowMaximized
+                ? _windowMaximizeRestoreBounds
+                : WindowState == WindowState.Normal
+                ? new Rect(Left, Top, ActualWidth, ActualHeight)
+                : RestoreBounds;
+            var handle = new WindowInteropHelper(this).Handle;
+            var monitor = MonitorFromWindow(handle, MonitorDefaultToNearest);
+            var monitorInfo = new MonitorInfo
+            {
+                Size = (uint)Marshal.SizeOf<MonitorInfo>(),
+            };
+            if (monitor == 0 || !GetMonitorInfoW(monitor, ref monitorInfo))
+                throw new InvalidOperationException(LocalizationService.Get("DisplayBoundsUnavailable"));
+            RootNavigation.IsPaneOpen = false;
+            CancelLightweightWindowWidthAnimation();
+            SizeToContent = SizeToContent.Manual;
+            PreviewPanel.ClearValue(WidthProperty);
+            PreviewPanel.ClearValue(MinWidthProperty);
+            PreviewPanel.ClearValue(MaxWidthProperty);
+            PreviewPanel.HorizontalAlignment = HorizontalAlignment.Stretch;
+            CenterColumn.MaxWidth = double.PositiveInfinity;
+            SetLightweightCenterColumnFill();
+            MainContentGrid.ClearValue(WidthProperty);
+            MainContentGrid.MaxWidth = double.PositiveInfinity;
+            MainContentGrid.HorizontalAlignment = HorizontalAlignment.Stretch;
+            SetNavigationPaneVisible(false);
+            SetWorkspaceSurfaceImmediate(LeftPanelHost, visible: false, width: WorkspaceDeviceWidth);
+            SetWorkspacePageImmediate(DevicePanel, visible: false);
+            SetWorkspacePageImmediate(MirroringPanel, visible: false);
+            SetWorkspaceSurfaceImmediate(ControlPanel, visible: false, width: WorkspaceRightWidth);
+            HeaderPanel.Visibility = Visibility.Collapsed;
+            EnvironmentPanel.Visibility = Visibility.Collapsed;
+            StatsPanel.Visibility = Visibility.Collapsed;
+            DeviceColumn.Width = new GridLength(0);
+            LeftGapColumn.Width = new GridLength(0);
+            RightGapColumn.Width = new GridLength(0);
+            ControlColumn.Width = new GridLength(0);
+            RootLayout.Margin = new Thickness(0);
+            SetFullScreenPreviewBackground(true);
+            HeaderGapRow.Height = new GridLength(0);
+            PreviewPanel.BorderThickness = new Thickness(0);
+            PreviewPanel.CornerRadius = new CornerRadius(0);
+            PreviewPanel.BorderBrush = Brushes.Black;
+            WindowState = WindowState.Normal;
+            WindowStyle = WindowStyle.None;
+            ResizeMode = ResizeMode.NoResize;
+            Topmost = true;
+            _isFullScreen = true;
+            ApplyWindowFramePolicy();
+            _ = SetWindowPos(handle, HwndTopMost,
+                monitorInfo.Monitor.Left, monitorInfo.Monitor.Top,
+                monitorInfo.Monitor.Right - monitorInfo.Monitor.Left,
+                monitorInfo.Monitor.Bottom - monitorInfo.Monitor.Top,
+                SwpFrameChanged | SwpShowWindow);
+        }
+        if (!_viewModel.IsMediaCastSelected) MainPreviewHost.Activate();
+        MainPreviewHost.IsFullScreenPresentation = _isFullScreen;
+        UpdateMainPreviewCornerProfile();
+        ApplyApplicationDisplayMode();
+        UpdateMediaCastFullScreenButton();
+        _viewModel.AddDiagnosticLog(AppLog.Event("main_fullscreen_state",
+            ("enabled", _isFullScreen)));
+    }
+
+    private void SetFullScreenPreviewBackground(bool isFullScreen)
+    {
+        if (isFullScreen)
+        {
+            Background = Brushes.Black;
+            AppShell.Background = Brushes.Black;
+            RootNavigation.Background = Brushes.Black;
+            RootLayout.Background = Brushes.Black;
+            MainContentGrid.Background = Brushes.Black;
+            CenterPanel.Background = Brushes.Black;
+            PreviewPanel.Background = Brushes.Black;
+            MediaCastSurface.Background = Brushes.Black;
+            MediaCastPlayerHost.Background = Brushes.Black;
+            MediaCastVideoHost.Background = Brushes.Black;
+            return;
+        }
+
+        SetResourceReference(BackgroundProperty, "AppBackgroundBrush");
+        AppShell.ClearValue(Panel.BackgroundProperty);
+        RootNavigation.Background = Brushes.Transparent;
+        RootLayout.ClearValue(Panel.BackgroundProperty);
+        MainContentGrid.ClearValue(Panel.BackgroundProperty);
+        CenterPanel.ClearValue(Panel.BackgroundProperty);
+        PreviewPanel.SetResourceReference(Panel.BackgroundProperty, "PreviewChromeBrush");
+        MediaCastSurface.SetResourceReference(Panel.BackgroundProperty, "PreviewChromeBrush");
+        MediaCastPlayerHost.SetResourceReference(Panel.BackgroundProperty, "PreviewChromeBrush");
+        MediaCastVideoHost.SetResourceReference(Panel.BackgroundProperty, "PreviewChromeBrush");
+    }
+
+    private void UpdateMediaCastFullScreenButton(bool? independentState = null)
+    {
+        var isFullScreen = independentState ??
+            (_mediaCastPreviewWindow?.IsFullScreen ?? _isFullScreen);
+        SetAnimatedMediaSymbol(MediaCastFullScreenIcon,
+            isFullScreen ? SymbolRegular.FullScreenMinimize20 :
+                SymbolRegular.FullScreenMaximize20);
+        MediaCastFullScreenButton.ToolTip = LocalizationService.Get(
+            isFullScreen ? "IndependentWindowExitFullScreen" : "FullScreenPreview");
+    }
+
+    private void SetNavigationPaneVisible(bool visible)
+    {
+        RootNavigation.IsPaneVisible = visible;
+        RootNavigation.ApplyTemplate();
+        if (RootNavigation.Template.FindName("PaneGrid", RootNavigation) is FrameworkElement pane)
+            pane.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void ShowMediaCastPreviewWindow()
+    {
+        if (_mediaCastPreviewWindow is not null)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_preview_activate_existing"));
+            _mediaCastPreviewWindow.Activate();
+            return;
+        }
+
+        var width = MediaCastMediaElement.NaturalVideoWidth > 0
+            ? (uint)MediaCastMediaElement.NaturalVideoWidth : 16U;
+        var height = MediaCastMediaElement.NaturalVideoHeight > 0
+            ? (uint)MediaCastMediaElement.NaturalVideoHeight : 9U;
+        _viewModel.AddDiagnosticLog(AppLog.Event("media_preview_window_create",
+            ("size", $"{width}x{height}"), ("opened", _mediaOpened),
+            ("source", AppLog.MediaSource(_mediaSource))));
+        MediaCastSurface.Children.Remove(MediaCastPlayerHost);
+        if (!NativePreviewWindow.TryCreateAndShowForContent(MediaCastPlayerHost,
+                width, height, LocalizationService.Get("MediaCastWindowTitle"),
+                () => !MediaCastMediaElement.IsMuted,
+                enabled =>
+                {
+                    MediaCastMediaElement.IsMuted = !enabled;
+                    _viewModel.UpdateMediaCastAudioControls(
+                        enabled, MediaCastMediaElement.Volume);
+                    UpdateMediaCastStatistics();
+                },
+                () => 1 + _viewModel.ActiveDeviceSessionCount,
+                 () =>
+                {
+                    var result = _viewModel.MuteOtherDeviceSessions(
+                        DeviceViewModel.MediaCastUdid);
+                    if (!string.IsNullOrWhiteSpace(result.Message))
+                         _viewModel.AddUiLog(result.Message);
+                 },
+                 AttachMediaCastToMainPreview, out var window,
+                 _viewModel.AddDiagnosticLog) || window is null)
+        {
+            AttachMediaCastToMainPreview();
+            throw new InvalidOperationException(
+                LocalizationService.Get("PreviewRendererAttachFailed"));
+        }
+
+        _mediaCastPreviewWindow = window;
+        window.FullScreenChanged += enabled => Dispatcher.BeginInvoke(
+            DispatcherPriority.Render, () =>
+            {
+                if (ReferenceEquals(_mediaCastPreviewWindow, window))
+                    UpdateMediaCastFullScreenButton(enabled);
+            });
+        SynchronizeMainPreviewHost();
+        window.Closed += (_, _) =>
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("media_preview_window_closed"));
+            if (ReferenceEquals(_mediaCastPreviewWindow, window))
+            {
+                _mediaCastPreviewWindow = null;
+                if (IsTrayMode && _mediaCastActive) _viewModel.RequestMediaCastStop();
+                SynchronizeMainPreviewHost();
+                UpdateMediaCastFullScreenButton();
+            }
+        };
+    }
+
+    private void AttachMediaCastToMainPreview()
+    {
+        if (!MediaCastSurface.Children.Contains(MediaCastPlayerHost))
+            MediaCastSurface.Children.Insert(0, MediaCastPlayerHost);
+        SynchronizeMainPreviewHost();
+    }
+
+    private void OnScreenshotClick(object sender, RoutedEventArgs e) => _ = CaptureScreenshotAsync();
+
+    private void OnMediaOutputToolbarClick(object sender, RoutedEventArgs e) =>
+        OnMediaOutputSettingsRequested();
+
+    // MediaElement is a WPF visual rather than a native capture session. The
+    // output services request frames on a worker thread, so marshal the
+    // render onto the UI dispatcher and return owned pixel buffers.
+    private VideoFrame? CaptureMediaCastVideoFrame(uint width, uint height)
+    {
+        if (!_mediaCastActive)
+            return null;
+        var pixels = CaptureMediaCastBgra(width, height, out var stride);
+        return pixels is null ? null : new VideoFrame(width, height, stride,
+            NextMediaCastOutputTimestamp(), pixels);
+    }
+
+    private Nv12VideoFrame? CaptureMediaCastNv12Frame(uint width, uint height)
+    {
+        if (!_mediaCastActive)
+            return null;
+        var bgra = CaptureMediaCastBgra(width, height, out _);
+        if (bgra is null) return null;
+        var nv12 = ConvertBgraToNv12(bgra, width, height);
+        return new Nv12VideoFrame(width, height, width,
+            NextMediaCastOutputTimestamp(), nv12);
+    }
+
+    private long NextMediaCastOutputTimestamp()
+    {
+        var wallClock = DateTime.UtcNow.Ticks;
+        while (true)
+        {
+            var previous = Volatile.Read(ref _mediaCastOutputTimestamp);
+            var next = Math.Max(wallClock, previous + 1);
+            if (Interlocked.CompareExchange(ref _mediaCastOutputTimestamp,
+                    next, previous) == previous)
+                return next;
+        }
+    }
+
+    private byte[]? CaptureMediaCastBgra(uint requestedWidth,
+        uint requestedHeight, out uint stride)
+    {
+        stride = 0;
+        if (requestedWidth < 2 || requestedHeight < 2 ||
+            requestedWidth > 3840 || requestedHeight > 2160)
+            return null;
+
+        if (!Dispatcher.CheckAccess())
+        {
+            uint capturedStride = 0;
+            var renderedPixels = Dispatcher.Invoke(() => CaptureMediaCastBgra(
+                requestedWidth, requestedHeight, out capturedStride));
+            stride = capturedStride;
+            return renderedPixels;
+        }
+
+        // Output capture can request frames at 60 fps. Forcing a full layout
+        // pass on every request blocks the dispatcher and competes directly
+        // with MediaElement composition. SizeChanged/normal WPF layout already
+        // keeps ActualWidth/ActualHeight current; only flush layout when a
+        // resize is genuinely pending.
+        if (!MediaCastVideoHost.IsMeasureValid ||
+            !MediaCastVideoHost.IsArrangeValid)
+            MediaCastVideoHost.UpdateLayout();
+        var sourceWidth = MediaCastVideoHost.ActualWidth;
+        var sourceHeight = MediaCastVideoHost.ActualHeight;
+        if (sourceWidth < 1 || sourceHeight < 1)
+            return null;
+        var targetWidth = checked((int)(requestedWidth & ~1U));
+        var targetHeight = checked((int)(requestedHeight & ~1U));
+        var drawing = new DrawingVisual();
+        using (var context = drawing.RenderOpen())
+        {
+            context.PushTransform(new ScaleTransform(
+                targetWidth / sourceWidth, targetHeight / sourceHeight));
+            context.DrawRectangle(new VisualBrush(MediaCastVideoHost), null,
+                new Rect(0, 0, sourceWidth, sourceHeight));
+        }
+        var bitmap = new RenderTargetBitmap(targetWidth, targetHeight,
+            96, 96, PixelFormats.Pbgra32);
+        bitmap.Render(drawing);
+        stride = checked((uint)(targetWidth * 4));
+        var pixels = new byte[checked((int)(stride * (uint)targetHeight))];
+        bitmap.CopyPixels(pixels, checked((int)stride), 0);
+        return pixels;
+    }
+
+    private static byte[] ConvertBgraToNv12(byte[] bgra, uint width, uint height)
+    {
+        var w = checked((int)width);
+        var h = checked((int)height);
+        var yPlaneBytes = checked(w * h);
+        var output = new byte[checked(yPlaneBytes + yPlaneBytes / 2)];
+        static byte ClampByte(int value) => (byte)Math.Clamp(value, 0, 255);
+        // The capture pipeline carries display RGB as full-range BT.709 NV12.
+        // Keep the range explicit so FFmpeg and downstream players do not
+        // expand light UI grays a second time as video-range samples.
+        static int Y(int r, int g, int b) =>
+            (54 * r + 183 * g + 19 * b + 128) >> 8;
+        static int U(int r, int g, int b) =>
+            ((-29 * r - 99 * g + 128 * b + 128) >> 8) + 128;
+        static int V(int r, int g, int b) =>
+            ((128 * r - 116 * g - 12 * b + 128) >> 8) + 128;
+
+        for (var y = 0; y < h; ++y)
+        for (var x = 0; x < w; ++x)
+        {
+            var offset = (y * w + x) * 4;
+            output[y * w + x] = ClampByte(Y(bgra[offset + 2],
+                bgra[offset + 1], bgra[offset]));
+        }
+        var uvOffset = yPlaneBytes;
+        for (var y = 0; y < h; y += 2)
+        for (var x = 0; x < w; x += 2)
+        {
+            var r = 0;
+            var g = 0;
+            var b = 0;
+            var count = 0;
+            for (var dy = 0; dy < 2 && y + dy < h; ++dy)
+            for (var dx = 0; dx < 2 && x + dx < w; ++dx)
+            {
+                var offset = ((y + dy) * w + x + dx) * 4;
+                b += bgra[offset];
+                g += bgra[offset + 1];
+                r += bgra[offset + 2];
+                ++count;
+            }
+            r /= count;
+            g /= count;
+            b /= count;
+            var uv = uvOffset + (y / 2) * w + x;
+            output[uv] = ClampByte(U(r, g, b));
+            output[uv + 1] = ClampByte(V(r, g, b));
+        }
+        return output;
+    }
+
+    private Task CaptureScreenshotAsync()
+    {
+        if (_mediaCastActive && _viewModel.IsMediaCastSelected)
+            return SaveScreenshotAsync(path => Task.FromResult(ScreenshotService.CaptureVisualPng(MediaCastVideoHost, path)), "media_cast");
+        return SaveScreenshotAsync(path => Task.Run(() => _viewModel.CaptureScreenshot(path)), "device");
+    }
+
+    private async Task SaveScreenshotAsync(Func<string, Task<string>> capture, string mode)
+    {
+        if (!await _screenshotGate.WaitAsync(0))
+        {
+            _viewModel.AddUiLog(LocalizationService.Get("ScreenshotBusy"));
+            return;
+        }
+        try
+        {
+            var suggested = ScreenshotService.CreateDefaultPath();
+            var dialog = new SaveFileDialog
+            {
+                Title = LocalizationService.Get("ScreenshotSaveTitle"),
+                Filter = LocalizationService.Get("ScreenshotPngFilter"),
+                DefaultExt = ".png",
+                AddExtension = true,
+                OverwritePrompt = true,
+                InitialDirectory = Path.GetDirectoryName(suggested),
+                FileName = Path.GetFileName(suggested),
+            };
+            if (dialog.ShowDialog(this) != true) return;
+            var path = dialog.FileName;
+            var saved = await capture(path);
+            _viewModel.AddUiLog(LocalizationService.Format("ScreenshotSavedFormat", saved));
+            _viewModel.AddDiagnosticLog(AppLog.Event("screenshot_complete",
+                ("mode", mode), ("success", true)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("screenshot_failed",
+                ("error", AppLog.Error(error))));
+            _viewModel.AddUiLog(LocalizationService.Format("ScreenshotFailedFormat", error.Message));
+        }
+        finally
+        {
+            _screenshotGate.Release();
+        }
+    }
+
+    private void OnPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        var key = ResolvePreviewKey(e);
+        if (_keyboardHook == 0)
+        {
+            var vk = KeyInterop.VirtualKeyFromKey(key);
+            if (RouteKeyboardEvent(new(vk, 0, false), true, ActiveInputDeviceUdid, _windowSource?.Handle ?? 0))
+            {
+                e.Handled = true;
+                return;
+            }
+        }
+        else if (RecoverShortcutPressFromWindow(new(Controls.PreviewKeyboardKind.Down,
+            KeyInterop.VirtualKeyFromKey(key))
+            { MessageTime = unchecked((uint)e.Timestamp), IsRepeat = e.IsRepeat },
+            ActiveInputDeviceUdid, _windowSource?.Handle ?? 0))
+        {
+            e.Handled = true;
+            return;
+        }
+        if (_mediaCastActive && _viewModel.IsMediaCastSelected &&
+            Keyboard.Modifiers == ModifierKeys.None &&
+            Keyboard.FocusedElement is not TextBoxBase &&
+            Keyboard.FocusedElement is not Slider &&
+            Keyboard.FocusedElement is not ButtonBase)
+        {
+            if (e.Key is Key.Space or Key.K)
+                SetLocalMediaCastPlayback(!_mediaShouldPlay);
+            else if (e.Key == Key.Left)
+                SeekMediaCastLocally(ReadMediaCastControlPosition(MediaCastMediaElement) - 10);
+            else if (e.Key == Key.Right)
+                SeekMediaCastLocally(ReadMediaCastControlPosition(MediaCastMediaElement) + 10);
+            else if (e.Key == Key.M)
+                OnMediaCastMuteClick(this, new RoutedEventArgs());
+            else
+                return;
+            e.Handled = true;
+            return;
+        }
+
+    }
+
+    private void OnPreviewKeyUp(object sender, KeyEventArgs e)
+    {
+        if (_keyboardHook == 0)
+            e.Handled = RouteKeyboardEvent(new(KeyInterop.VirtualKeyFromKey(ResolvePreviewKey(e)), 0, false),
+                false, ActiveInputDeviceUdid, _windowSource?.Handle ?? 0);
+        else if (ReleaseShortcutFromWindow(new(Controls.PreviewKeyboardKind.Up,
+            KeyInterop.VirtualKeyFromKey(ResolvePreviewKey(e))) { MessageTime = unchecked((uint)e.Timestamp) },
+            ActiveInputDeviceUdid, _windowSource?.Handle ?? 0)) e.Handled = true;
+    }
+
+    private void OnPreviewMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        if (_rawMouseInputEnabled || _shortcutSettingsWindow is not null) return;
+        var button = e.ChangedButton switch { MouseButton.Right => (byte)2, MouseButton.Middle => (byte)4, MouseButton.XButton1 => (byte)8, MouseButton.XButton2 => (byte)16, _ => (byte)0 };
+        if (button != 0 && TryHandleMouseShortcut(button))
+            e.Handled = true;
+    }
+
+    private static Key ResolvePreviewKey(KeyEventArgs e) => e.Key switch
+    {
+        Key.System => e.SystemKey,
+        // When a non-English Windows IME is active, WPF reports the key-down
+        // as VK_PROCESSKEY (Key.ImeProcessed) and only exposes the physical
+        // key through ImeProcessedKey. Forwarding 229 would drop the key-down
+        // while the matching key-up still contains A/S/D/etc.
+        Key.ImeProcessed => e.ImeProcessedKey,
+        Key.DeadCharProcessed => e.DeadCharProcessedKey,
+        _ => e.Key,
+    };
+
+    private void OnShortcutSettingsClick(object sender, RoutedEventArgs e) =>
+        ShowShortcutSettings();
+
+    private void ToggleBluetoothControlFromHotkey()
+    {
+        BluetoothControlNoticeWindow.TryCloseActive();
+        HandleConfiguredShortcut(BluetoothShortcutAction.BluetoothControl);
+    }
+
+    private void ShowReverseControlStatus(ControlStatusMode mode, string? targetUdid = null, nint sourceWindow = 0)
+    {
+        var target = targetUdid ?? _viewModel.SelectedDevice?.Udid;
+        if (mode == ControlStatusMode.Bluetooth && _viewModel.IsBluetoothControlTarget(target)) return;
+        if (mode != ControlStatusMode.Bluetooth && _viewModel.IsDeviceControlEnabled(target)) return;
+        var status = _viewModel.GetControlStatus(mode, target);
+        if (sourceWindow == 0)
+        {
+            var independent = _secondaryMirrors.GetWindowHandle(target);
+            if (independent != 0 && _keyboardForegroundWindow() == independent) sourceWindow = independent;
+        }
+        // Register before Begin can synchronously publish a prompt. VM status
+        // updates keep this route; an explicit main-window start clears it.
+        ReverseControlStatusWindow.SetOwnerRoute(this, status, sourceWindow);
+        status.QuietAutomaticStartup = false;
+        if (status.Current is not { IsTerminal: false } &&
+            !_viewModel.IsUsbControlTarget(target))
+            status.Begin(mode, _viewModel.Devices.FirstOrDefault(d =>
+                DeviceViewModel.UdidEquals(d.Udid, target))?.Name ?? "iPhone");
+        ReverseControlStatusWindow.Show(this, status,
+            () => _ = _viewModel.CancelReverseControlAsync(mode, target),
+            countdownElapsed: mode == ControlStatusMode.Bluetooth
+                ? _viewModel.BeginBluetoothControlInputAfterStatusCountdown : null);
+    }
+
+    private void HandleConfiguredShortcut(BluetoothShortcutAction action)
+    {
+        if (_shortcutSettingsWindow is not null) return;
+        if (action == BluetoothShortcutAction.BossKey)
+        {
+            _ = ToggleBossKeyWindowsAsync();
+            return;
+        }
+        if (action == BluetoothShortcutAction.BluetoothControl)
+        {
+            var target = ActiveInputDeviceUdid;
+            // The model revokes input synchronously before draining held HID
+            // reports. Pausing keeps the connection and skips the setup dialog.
+            ShowReverseControlStatus(ControlStatusMode.Bluetooth, target);
+            _ = ToggleBluetoothControlInputFromShortcutAsync(target);
+        }
+        else if (action == BluetoothShortcutAction.WirelessControl)
+        {
+            ShowReverseControlStatus(ControlStatusMode.Wireless, ActiveInputDeviceUdid);
+            _ = _viewModel.ToggleWirelessControlAsync(ActiveInputDeviceUdid);
+        }
+        else if (action == BluetoothShortcutAction.WiredControl)
+        {
+            ShowReverseControlStatus(ControlStatusMode.Usb, ActiveInputDeviceUdid);
+            _ = _viewModel.ToggleWiredControlAsync(ActiveInputDeviceUdid);
+        }
+        else
+            _ = SendConfiguredSystemShortcutAsync(action);
+    }
+
+    private async Task ToggleBluetoothControlInputFromShortcutAsync(string? target)
+    {
+        var startingSession = !_viewModel.IsBluetoothControlEnabled || !_viewModel.IsBluetoothControlTarget(target);
+        Func<bool>? canResume = null;
+        if (_viewModel.BluetoothControlIsInputPaused && _viewModel.IsBluetoothControlTarget(target))
+        {
+            var window = GetControlKeyboardWindow(target);
+            if (_keyboardForegroundWindow() != window)
+            {
+                if (_secondaryMirrors.GetWindowHandle(target) != 0) _secondaryMirrors.Activate(target);
+                else Activate();
+            }
+            // Windows may reject foreground activation. Also recheck after a
+            // queued resume waits for BLE release, before hiding/clipping the
+            // desktop cursor or admitting input into the phone.
+            canResume = () => window != 0 && _keyboardForegroundWindow() == window;
+        }
+        await _viewModel.ToggleBluetoothControlAsync(target, canResume);
+        if (startingSession && _viewModel.IsBluetoothControlEnabled)
+            _secondaryMirrors.PrepareBluetoothControlWindow(target);
+        if (!IsBluetoothControlActiveFor(target)) return;
+        if (_activeControlWindow != 0) _secondaryMirrors.Activate(target);
+        else
+        {
+            Activate();
+            MainPreviewHost.Focus();
+        }
+    }
+
+    private async Task ToggleBossKeyWindowsAsync()
+    {
+        if (Interlocked.Exchange(ref _bossKeyChanging, 1) != 0) return;
+        var restoring = _bossKeyHidden;
+        var routeHeld = false;
+        Interlocked.Exchange(ref _bluetoothRouteChanging, 1);
+        try
+        {
+            if (restoring)
+            {
+                BossKeyWindowVisibility.RestoreAll();
+                NativePreviewWindow.SetAllBossKeyHidden(false);
+            }
+            else
+            {
+                _bossKeyHidden = true;
+                ApplyBluetoothControlInputState(activateIndependentWindow: false);
+                BossKeyWindowVisibility.HideAll();
+                NativePreviewWindow.SetAllBossKeyHidden(true);
+            }
+
+            await _bluetoothRouteGate.WaitAsync();
+            routeHeld = true;
+            if (restoring)
+            {
+                _bossKeyHidden = false;
+                ApplyBluetoothControlInputState();
+            }
+            else if (_viewModel.IsBluetoothControlEnabled)
+            {
+                try { await _viewModel.ReleaseBluetoothControlInputAsync(); }
+                catch (Exception error)
+                {
+                    _viewModel.AddDiagnosticLog(AppLog.Event(
+                        "boss_key_input_release_failed",
+                        ("error", AppLog.Error(error))));
+                }
+            }
+            _viewModel.AddDiagnosticLog(AppLog.Event("boss_key_toggled",
+                ("hidden", _bossKeyHidden),
+                ("wpf_windows", BossKeyWindowVisibility.HiddenWindowCount),
+                ("reverse_control", IsBluetoothControlActive)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event("boss_key_toggle_failed",
+                ("hidden", _bossKeyHidden), ("error", AppLog.Error(error))));
+        }
+        finally
+        {
+            if (routeHeld) _bluetoothRouteGate.Release();
+            Volatile.Write(ref _bluetoothRouteChanging, 0);
+            Volatile.Write(ref _bossKeyChanging, 0);
+        }
+    }
+
+    private async Task SendConfiguredSystemShortcutAsync(
+        BluetoothShortcutAction action)
+    {
+        void Skipped(string reason) => DiagnosticLogger.ReverseControl("keyboard_input", "system_shortcut_skipped",
+            ("action", action.ToString()), ("reason", reason));
+        if (_keyboardRouter.Mode == KeyboardInputMode.None) { Skipped("owner_none"); return; }
+        if (!IsControlKeyboardForeground) { Skipped("focus_or_input_guard"); return; }
+        var target = _activeControlWindow != 0 ? _activeControlUdid :
+            _viewModel.SelectedDevice?.Udid;
+        if (action == BluetoothShortcutAction.ReverseControl) return;
+        if (action == BluetoothShortcutAction.Dock && !CanSendDockShortcut(target))
+        {
+            Skipped("dock_requires_ipad");
+            return;
+        }
+        var canSend = CapturePointerSendGuard(GetControlKeyboardWindow(target));
+        var indigoButton = GetIndigoButton(action);
+        var usage = action switch
+        {
+            BluetoothShortcutAction.ControlCenter => (byte)0x06, // C
+            BluetoothShortcutAction.NotificationCenter => (byte)0x11, // N
+            BluetoothShortcutAction.AppSwitcher => (byte)0,
+            BluetoothShortcutAction.Home => (byte)0x0B, // H
+            BluetoothShortcutAction.Dock => (byte)0x04, // A
+            BluetoothShortcutAction.Siri => (byte)0x16, // S
+            _ => (byte)0,
+        };
+        DirectKeyboardRoute? sentRoute = null;
+        SemaphoreSlim? sessionGate = null;
+        DiagnosticLogger.ReverseControl("keyboard_input", "system_shortcut_requested",
+            ("action", action.ToString()), ("gate_busy", _systemShortcutGate.CurrentCount == 0));
+        await _systemShortcutGate.WaitAsync();
+        try
+        {
+            if (!canSend() || _shortcutSettingsWindow is not null) { Skipped("invalidated_while_waiting"); return; }
+            var route = _viewModel.CaptureDirectKeyboardRoute(target);
+            if (route is null) { Skipped("route_unavailable"); return; }
+            sessionGate = KeyboardSessionGate(route);
+            await sessionGate.WaitAsync();
+            sentRoute = route;
+            if (!canSend() || !route.IsCurrent()) { Skipped("route_or_focus_changed"); return; }
+            var bluetoothTarget = route.Transport == "BluetoothDirect";
+            var usbTarget = !bluetoothTarget;
+            if (action == BluetoothShortcutAction.AppSwitcher && bluetoothTarget)
+                await _viewModel.SendBluetoothAppSwitcherAsync(target, canSend);
+            else if (usage != 0 && bluetoothTarget)
+                await _viewModel.SendBluetoothSystemShortcutAsync(usage, target, canSend);
+            else if (indigoButton is { } consumer && bluetoothTarget)
+                await _viewModel.SendBluetoothConsumerShortcutAsync(
+                    consumer.Code, consumer.HoldMs, target, canSend);
+            if (usbTarget && action is BluetoothShortcutAction.ControlCenter or
+                    BluetoothShortcutAction.NotificationCenter)
+            {
+                // Globe+C/N is accepted as a keyboard report by iOS but can
+                // do nothing on a CoreDevice touch connection. Use the same
+                // physical edge gesture as the phone on these transports.
+                await SendUsbPanelGestureAsync(route, action, canSend);
+            }
+            else if (action == BluetoothShortcutAction.AppSwitcher && usbTarget)
+            {
+                // Keep both presses in one bridge command: delays between
+                // separate host writes can exceed iOS's double-click window.
+                var home = GetIndigoButton(BluetoothShortcutAction.Home)!.Value;
+                if (route.SendButtonAsync is not null)
+                    await route.SendButtonAsync(home.Page, home.Code, "double_press", canSend);
+            }
+            else if (indigoButton is { } button && usbTarget)
+            {
+                await SendUsbButtonPulseAsync(button, route, canSend);
+            }
+            else if (usage != 0 && usbTarget)
+            {
+                await SendUsbSystemShortcutAsync(usage, route, canSend);
+            }
+            _viewModel.AddDiagnosticLog(AppLog.Event("system_shortcut_sent",
+                ("action", action.ToString()), ("device", AppLog.Device(target)),
+                ("bluetooth", bluetoothTarget), ("usb", usbTarget)));
+        }
+        catch (Exception error)
+        {
+            _viewModel.AddDiagnosticLog(AppLog.Event(
+                "system_shortcut_failed",
+                ("action", action.ToString()), ("device", AppLog.Device(target)),
+                ("error", AppLog.Error(error))));
+        }
+        finally
+        {
+            try
+            {
+                // System shortcuts may emit an empty keyboard report. Restore
+                // unrelated held keys to the same captured session, never to a
+                // replacement device or after focus/mode invalidation.
+                if (sentRoute is not null) await RestoreDirectKeyboardStateAsync(sentRoute, canSend);
+            }
+            catch (Exception error)
+            {
+                DiagnosticLogger.ReverseControlWarning("keyboard_input", "shortcut_restore_failed", ("error", error.Message));
+                ResetKeyboardOwnership();
+            }
+            finally { sessionGate?.Release(); _systemShortcutGate.Release(); }
+        }
+    }
+
+    private async Task SendUsbButtonPulseAsync(
+        (ushort Page, ushort Code, int HoldMs) button, DirectKeyboardRoute route,
+        Func<bool>? canSend = null)
+    {
+        if (route.SendButtonAsync is null) return;
+        try
+        {
+            await route.SendButtonAsync(button.Page, button.Code, "down", canSend);
+            await Task.Delay(button.HoldMs);
+        }
+        finally
+        {
+            await route.SendButtonAsync(button.Page, button.Code, "up", null);
+        }
+    }
+
+    private async Task SendUsbPanelGestureAsync(DirectKeyboardRoute route,
+        BluetoothShortcutAction action, Func<bool> canSend)
+    {
+        var touch = _viewModel.CaptureTouchRoute(route.Target,
+            () => route.IsCurrent() && canSend(), (x, y) => (x, y));
+        if (touch is null) return;
+        var product = _viewModel.Devices.FirstOrDefault(device =>
+            DeviceViewModel.UdidEquals(device.Udid, route.Target))?.ProductType;
+        var panel = AppleDisplayCatalog.Find(product);
+        var fromBottom = action == BluetoothShortcutAction.ControlCenter &&
+            product?.StartsWith("iPhone", StringComparison.Ordinal) == true &&
+            panel is not null && panel.Height < 2 * panel.Width;
+        await SendPanelGestureAsync(touch, action == BluetoothShortcutAction.ControlCenter, fromBottom);
+    }
+
+    private static async Task SendPanelGestureAsync(MappedTouchRoute touch,
+        bool controlCenter, bool fromBottom)
+    {
+        var x = controlCenter && !fromBottom ? 0.98 : 0.5;
+        var startY = fromBottom ? 0.998 : 0.002;
+        var endY = fromBottom ? 0.3 : 0.7;
+        var y = startY;
+        Task Send(string state) => touch.SendAsync(state, x, y, default);
+        try
+        {
+            await Send("down");
+            for (var step = 1; step <= 12 && touch.IsCurrent(); ++step)
+            {
+                await Task.Delay(16);
+                y = startY + (endY - startY) * step / 12;
+                await Send("move");
+            }
+        }
+        finally { await Send("up"); }
+    }
+
+    private static (ushort Page, ushort Code, int HoldMs)? GetIndigoButton(
+        BluetoothShortcutAction action) => action switch
+        {
+            BluetoothShortcutAction.Home =>
+                (CoreDeviceTouchProtocol.IndigoConsumerUsagePage,
+                 CoreDeviceTouchProtocol.IndigoHome, 50),
+            BluetoothShortcutAction.Siri =>
+                (CoreDeviceTouchProtocol.IndigoConsumerUsagePage,
+                 CoreDeviceTouchProtocol.IndigoSiri, 1000),
+            BluetoothShortcutAction.VolumeUp =>
+                (CoreDeviceTouchProtocol.IndigoConsumerUsagePage,
+                 CoreDeviceTouchProtocol.IndigoVolumeUp, 50),
+            BluetoothShortcutAction.VolumeDown =>
+                (CoreDeviceTouchProtocol.IndigoConsumerUsagePage,
+                 CoreDeviceTouchProtocol.IndigoVolumeDown, 50),
+            BluetoothShortcutAction.LockScreen =>
+                (CoreDeviceTouchProtocol.IndigoConsumerUsagePage,
+                 // iOS treats a very short side-button pulse as bounce noise.
+                 CoreDeviceTouchProtocol.IndigoLock, 500),
+            _ => null,
+        };
+
+    private void SetWindowsCursorHidden(bool hidden)
+    {
+        if (hidden)
+        {
+            if (IsSystemCursorVisible(out var queryFailed))
+                while (ShowCursor(false) >= 0) { }
+            else if (queryFailed && !_windowsCursorHidden)
+                ShowCursor(false);
+            _windowsCursorHidden = true;
+        }
+        else
+        {
+            if (!IsSystemCursorVisible(out var queryFailed))
+            {
+                if (queryFailed && _windowsCursorHidden) ShowCursor(true);
+                else while (ShowCursor(true) < 0) { }
+            }
+            _windowsCursorHidden = false;
+        }
+    }
+
+    private bool IsSystemCursorVisible(out bool queryFailed)
+    {
+        var cursor = new CursorInfo
+        {
+            Size = (uint)Marshal.SizeOf<CursorInfo>(),
+        };
+        if (!GetCursorInfo(ref cursor))
+        {
+            queryFailed = true;
+            _viewModel.AddDiagnosticLog(AppLog.Event("windows_cursor_query_failed",
+                ("win32_error", Marshal.GetLastWin32Error())));
+            return false;
+        }
+        queryFailed = false;
+        return (cursor.Flags & CursorShowing) != 0;
+    }
+
+    private void ClipWindowsCursorToControlSurface()
+    {
+        if (!IsBluetoothMouseCaptured) return;
+        var handle = _activeControlWindow != 0
+            ? _activeControlWindow : MainPreviewHost.WindowHandle;
+        if (handle == 0 || !GetWindowRect(handle, out var bounds) ||
+            bounds.Right <= bounds.Left || bounds.Bottom <= bounds.Top)
+            return;
+        // Clip the hidden Windows cursor to the active preview. Raw Input is
+        // still delivered as relative motion, but the physical cursor cannot
+        // leave the controlled surface and click another application.
+        if (!ClipCursor(ref bounds))
+            _viewModel.AddDiagnosticLog(AppLog.Event("control_cursor_clip_failed",
+                ("win32_error", Marshal.GetLastWin32Error()),
+                ("window", AppLog.Handle((ulong)handle.ToInt64()))));
+    }
+
+    private void EnforceBluetoothCursorConfinement()
+    {
+        // The shell (Start menu, taskbar, UAC) and other processes can replace
+        // or clear our ClipCursor rect at any time. Without a periodic reassert
+        // the hidden cursor silently escapes the mirrored picture and its
+        // clicks land in unrelated applications.
+        if (Interlocked.Exchange(ref _cursorClipWatchdogRunning, 1) != 0) return;
+        try
+        {
+            if (!IsBluetoothMouseCaptured || Volatile.Read(ref _activeUsbInputEnabled))
+                return;
+            var handle = _activeControlWindow != 0
+                ? _activeControlWindow : MainPreviewHost.WindowHandle;
+            if (handle == 0 || !GetWindowRect(handle, out var bounds) ||
+                bounds.Right <= bounds.Left || bounds.Bottom <= bounds.Top)
+                return;
+            var current = new NativeRect();
+            if (!GetClipCursor(ref current)) return;
+            if (current.Left == bounds.Left && current.Top == bounds.Top &&
+                current.Right == bounds.Right && current.Bottom == bounds.Bottom)
+                return;
+            bool clipped;
+            lock (_cursorClipSync)
+            {
+                if (!IsBluetoothMouseCaptured) return;
+                clipped = ClipCursor(ref bounds);
+            }
+            if (clipped)
+            {
+                var now = Stopwatch.GetTimestamp();
+                var last = Interlocked.Read(ref _lastCursorClipReassertLogTimestamp);
+                if (last == 0 || (now - last) * 1000.0 / Stopwatch.Frequency >= 1000)
+                {
+                    Interlocked.Exchange(ref _lastCursorClipReassertLogTimestamp, now);
+                    _viewModel.AddDiagnosticLog(AppLog.Event("control_cursor_clip_reasserted",
+                        ("left", bounds.Left), ("top", bounds.Top),
+                        ("right", bounds.Right), ("bottom", bounds.Bottom),
+                        ("clip_left", current.Left), ("clip_top", current.Top),
+                        ("clip_right", current.Right), ("clip_bottom", current.Bottom)));
+                }
+            }
+            if (IsSystemCursorVisible(out _))
+            {
+                // ShowCursor is thread-affine; reassert hidden state on the
+                // dispatcher thread that owns the preview HWNDs.
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    if (IsBluetoothMouseCaptured &&
+                        !Volatile.Read(ref _activeUsbInputEnabled))
+                        SetWindowsCursorHidden(true);
+                });
+            }
+        }
+        catch
+        {
+            // A watchdog tick must never surface exceptions to the timer infra.
+        }
+        finally
+        {
+            Volatile.Write(ref _cursorClipWatchdogRunning, 0);
+        }
+    }
+
+    private nint KeyboardHookProcedure(int code, nint wParam, nint lParam)
+    {
+        if (code >= 0 && ProcessKeyboardHook(Marshal.PtrToStructure<LowLevelKeyboardData>(lParam), wParam))
+            return 1;
+        return CallNextHookEx(0, code, wParam, lParam);
+    }
+
+    private const uint MonitorDefaultToNearest = 2;
+    [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int index);
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoZOrder = 0x0004;
+    private const uint SwpNoActivate = 0x0010;
+    private const uint SwpNoCopyBits = 0x0100;
+    private const uint SwpFrameChanged = 0x0020;
+    private const uint SwpShowWindow = 0x0040;
+    private static readonly nint HwndTopMost = new(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        internal int Left;
+        internal int Top;
+        internal int Right;
+        internal int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WorkspaceWindowPosition
+    {
+        internal nint Window, InsertAfter;
+        internal int X, Y, Width, Height;
+        internal uint Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo
+    {
+        internal uint Size;
+        internal NativeRect Monitor;
+        internal NativeRect WorkArea;
+        internal uint Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputDevice
+    {
+        internal ushort UsagePage;
+        internal ushort Usage;
+        internal uint Flags;
+        internal nint Target;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputHeader
+    {
+        internal uint Type;
+        internal uint Size;
+        internal nint Device;
+        internal nint WParam;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    private struct RawMouse
+    {
+        [FieldOffset(0)]
+        internal ushort Flags;
+        [FieldOffset(2)]
+        internal ushort AlignmentPadding;
+        [FieldOffset(4)]
+        internal ushort ButtonFlags;
+        [FieldOffset(6)]
+        internal ushort ButtonData;
+        [FieldOffset(8)]
+        internal uint RawButtons;
+        [FieldOffset(12)]
+        internal int LastX;
+        [FieldOffset(16)]
+        internal int LastY;
+        [FieldOffset(20)]
+        internal uint ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 48)]
+    private struct RawInput
+    {
+        [FieldOffset(0)]
+        internal RawInputHeader Header;
+        [FieldOffset(24)]
+        internal RawMouse Mouse;
+        [FieldOffset(24)]
+        internal RawKeyboard Keyboard;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawKeyboard
+    {
+        internal ushort MakeCode;
+        internal ushort Flags;
+        internal ushort Reserved;
+        internal ushort VirtualKey;
+        internal uint Message;
+        internal uint ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CursorInfo
+    {
+        internal uint Size;
+        internal uint Flags;
+        internal nint Cursor;
+        internal int X;
+        internal int Y;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern nint MonitorFromWindow(nint window, uint flags);
+
+    [DllImport("user32.dll")]
+    private static extern int ShowCursor([MarshalAs(UnmanagedType.Bool)] bool show);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetCursorInfo(ref CursorInfo cursorInfo);
+
+    private delegate nint LowLevelKeyboardProc(int code, nint wParam, nint lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LowLevelKeyboardData
+    {
+        internal uint VirtualKey;
+        internal uint ScanCode;
+        internal uint Flags;
+        internal uint Time;
+        internal nint ExtraInformation;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern nint SetWindowsHookEx(int hookType,
+        LowLevelKeyboardProc callback, nint module, uint threadId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern nint GetModuleHandle(string? moduleName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(nint hook);
+
+    [DllImport("user32.dll")]
+    private static extern nint CallNextHookEx(nint hook, int code,
+        nint wParam, nint lParam);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int virtualKey);
+
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int virtualKey);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfoW(nint monitor, ref MonitorInfo monitorInfo);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(nint window, nint insertAfter,
+        int x, int y, int width, int height, uint flags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RegisterRawInputDevices(
+        RawInputDevice[] devices, uint count, uint size);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputData(nint rawInput, uint command,
+        nint data, ref uint size, uint headerSize);
+
+    [DllImport("user32.dll")]
+    private static extern nint DefWindowProcW(nint window, int message,
+        nint wParam, nint lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetWindowRect(nint window, out NativeRect rect);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint window);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ClipCursor(ref NativeRect rect);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ClipCursor(nint rect);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetClipCursor(ref NativeRect rect);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PeekMessageW(ref NativeMessage message, nint window,
+        uint messageFilterMin, uint messageFilterMax, uint removeMessages);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeMessage
+    {
+        internal nint HWnd;
+        internal uint Message;
+        internal nint WParam;
+        internal nint LParam;
+        internal uint Time;
+        internal Point Point;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RegisterHotKey(nint window, int id, uint modifiers,
+        uint virtualKey);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnregisterHotKey(nint window, int id);
+
+}

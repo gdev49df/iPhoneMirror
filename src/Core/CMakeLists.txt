@@ -1,0 +1,310 @@
+set(IPHONEMIRROR_CORE_SOURCES
+    "${CMAKE_BINARY_DIR}/src/Core/iPhoneMirror.Core.rc"
+    src/CoreApi.cpp
+    src/Logging.cpp
+    src/Protocol/Plist.cpp
+    src/Protocol/QuickTimePacket.cpp
+    src/Protocol/QuickTimeSession.cpp
+    src/Transport/Socket.cpp
+    src/Transport/UsbMuxClient.cpp
+    src/Transport/QtUsbTransport.cpp
+    src/Transport/LibUsb0Transport.cpp
+    src/Device/AppleUsbDiscovery.cpp
+    src/Device/DeviceManager.cpp
+    src/Capture/CaptureSession.cpp
+    src/Capture/UsbOrientationMonitor.cpp
+    src/Capture/WirelessReceiverHub.cpp
+    src/Capture/WirelessCaptureSession.cpp
+    src/Media/H264.cpp
+    src/Media/BundledH264Decoder.cpp
+    src/Media/CoreMedia.cpp
+    src/Media/MediaFoundationDecoder.cpp
+    src/Media/ScreenContentGeometry.cpp
+    src/Audio/WasapiRenderer.cpp
+    src/Renderer/D3D11PreviewRenderer.cpp
+)
+
+add_library(iPhoneMirror.Core SHARED ${IPHONEMIRROR_CORE_SOURCES})
+
+target_compile_definitions(iPhoneMirror.Core PRIVATE
+    IPHONEMIRROR_CORE_EXPORTS
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+
+target_compile_options(iPhoneMirror.Core PRIVATE
+    /W4
+    /permissive-
+    /utf-8
+    /EHsc
+)
+
+target_include_directories(iPhoneMirror.Core
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/src/WirelessHost
+        ${PROJECT_SOURCE_DIR}/third_party/libusb/include
+        ${PROJECT_SOURCE_DIR}/third_party/libusb-win32/include
+)
+
+target_link_libraries(iPhoneMirror.Core PRIVATE
+    ws2_32
+    bcrypt
+    setupapi
+    cfgmgr32
+    advapi32
+    shell32
+    mfplat
+    mf
+    mfuuid
+    wmcodecdspuuid
+    d3d11
+    d3dcompiler
+    dcomp
+    dxgi
+    ole32
+    avrt
+    winhttp
+    delayimp
+    "${PROJECT_SOURCE_DIR}/third_party/libusb/lib/x64/libusb-1.0.lib"
+    "${PROJECT_SOURCE_DIR}/third_party/libusb-win32/lib/x64/libusb0-dynamic.lib"
+)
+target_link_options(iPhoneMirror.Core PRIVATE /DELAYLOAD:libusb0.dll)
+
+add_custom_command(TARGET iPhoneMirror.Core POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${PROJECT_SOURCE_DIR}/third_party/libusb/bin/x64/libusb-1.0.dll
+        $<TARGET_FILE_DIR:iPhoneMirror.Core>/libusb-1.0.dll
+)
+
+# B-mode native AVC 4:4:4 uses the same pinned LGPL decoder as AirPlay.
+# Keep it optional at runtime; negotiation advertises 4:4:4 only when present.
+foreach(library avcodec-58.dll avutil-56.dll)
+    add_custom_command(TARGET iPhoneMirror.Core POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:iPhoneMirror.Core>/Wireless
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${PROJECT_SOURCE_DIR}/third_party/airplay-server/bin/x64/${library}
+            $<TARGET_FILE_DIR:iPhoneMirror.Core>/Wireless/${library})
+endforeach()
+
+set_target_properties(iPhoneMirror.Core PROPERTIES
+    OUTPUT_NAME "iPhoneMirror.Core"
+    WINDOWS_EXPORT_ALL_SYMBOLS OFF
+)
+
+add_executable(iPhoneMirror.UsbConfigurationSwitch
+    tools/UsbConfigurationSwitch.cpp
+    tools/UsbDeviceReconnect.cpp)
+target_include_directories(iPhoneMirror.UsbConfigurationSwitch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/third_party/libusb-win32/include)
+target_compile_definitions(iPhoneMirror.UsbConfigurationSwitch PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(iPhoneMirror.UsbConfigurationSwitch PRIVATE
+    /W4 /permissive- /utf-8 /EHsc)
+target_link_libraries(iPhoneMirror.UsbConfigurationSwitch PRIVATE
+    cfgmgr32
+    setupapi
+    advapi32
+    "${PROJECT_SOURCE_DIR}/third_party/libusb-win32/lib/x64/libusb0-dynamic.lib")
+
+if(IPHONEMIRROR_BUILD_TESTS)
+    enable_testing()
+    add_executable(iPhoneMirror.LoggingRotation.Tests
+        tests/LoggingRotationTests.cpp src/Logging.cpp)
+    target_include_directories(iPhoneMirror.LoggingRotation.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(iPhoneMirror.LoggingRotation.Tests PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(iPhoneMirror.LoggingRotation.Tests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    target_link_libraries(iPhoneMirror.LoggingRotation.Tests PRIVATE bcrypt)
+    add_test(NAME LoggingRotationTests COMMAND iPhoneMirror.LoggingRotation.Tests)
+    set_tests_properties(LoggingRotationTests PROPERTIES TIMEOUT 30)
+
+    add_executable(iPhoneMirror.ScreenContentGeometry.Tests
+        tests/ScreenContentGeometryTests.cpp
+        src/Media/ScreenContentGeometry.cpp)
+    target_include_directories(iPhoneMirror.ScreenContentGeometry.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(iPhoneMirror.ScreenContentGeometry.Tests PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(iPhoneMirror.ScreenContentGeometry.Tests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME ScreenContentGeometryTests COMMAND iPhoneMirror.ScreenContentGeometry.Tests)
+
+    add_executable(iPhoneMirror.UsbDeviceReconnect.Tests tests/UsbDeviceReconnectTests.cpp)
+    target_include_directories(iPhoneMirror.UsbDeviceReconnect.Tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(iPhoneMirror.UsbDeviceReconnect.Tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(iPhoneMirror.UsbDeviceReconnect.Tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME UsbDeviceReconnectTests COMMAND iPhoneMirror.UsbDeviceReconnect.Tests)
+    add_executable(iPhoneMirror.Core.Tests
+        tests/CoreTests.cpp
+        tests/SdrBgraConverterTests.cpp
+        tests/PreviewOpacitySmoke.cpp
+        tests/PreviewStaticFrameSmoke.cpp
+        tests/PreviewCadenceSmoke.cpp
+        tests/PreviewOwnershipSmoke.cpp
+        tests/WasapiUnderrunSmoke.cpp
+        src/Renderer/D3D11PreviewRenderer.cpp
+        src/Protocol/Plist.cpp
+        src/Protocol/QuickTimePacket.cpp
+        src/Protocol/QuickTimeSession.cpp
+        src/Media/H264.cpp
+        src/Media/BundledH264Decoder.cpp
+        src/Media/CoreMedia.cpp
+        src/Media/MediaFoundationDecoder.cpp
+        src/Media/ScreenContentGeometry.cpp
+        src/Audio/WasapiRenderer.cpp
+        src/Transport/Socket.cpp
+        src/Transport/UsbMuxClient.cpp
+        src/Transport/QtUsbTransport.cpp
+        src/Transport/LibUsb0Transport.cpp
+        src/Device/AppleUsbDiscovery.cpp
+        src/Capture/CaptureSession.cpp
+        src/Capture/UsbOrientationMonitor.cpp
+        src/Capture/WirelessReceiverHub.cpp
+        src/Capture/WirelessCaptureSession.cpp
+        src/Logging.cpp
+    )
+    target_include_directories(iPhoneMirror.Core.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/src/WirelessHost
+        ${PROJECT_SOURCE_DIR}/third_party/libusb/include
+        ${PROJECT_SOURCE_DIR}/third_party/libusb-win32/include
+    )
+    target_compile_definitions(iPhoneMirror.Core.Tests PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+        IPHONEMIRROR_PREVIEW_TEST_HOOKS
+    )
+    target_compile_options(iPhoneMirror.Core.Tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_libraries(iPhoneMirror.Core.Tests PRIVATE
+        iPhoneMirror.Core
+        "${PROJECT_SOURCE_DIR}/third_party/libusb/lib/x64/libusb-1.0.lib"
+        "${PROJECT_SOURCE_DIR}/third_party/libusb-win32/lib/x64/libusb0-dynamic.lib"
+        mfplat mf mfuuid wmcodecdspuuid d3d11 dxgi dcomp d3dcompiler dwmapi
+        ole32 advapi32 setupapi cfgmgr32 avrt winhttp shell32
+        ws2_32
+        bcrypt
+        delayimp
+    )
+    target_link_options(iPhoneMirror.Core.Tests PRIVATE /DELAYLOAD:libusb0.dll)
+    add_custom_command(TARGET iPhoneMirror.Core.Tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${PROJECT_SOURCE_DIR}/third_party/libusb/bin/x64/libusb-1.0.dll
+            $<TARGET_FILE_DIR:iPhoneMirror.Core.Tests>/libusb-1.0.dll
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures
+            $<TARGET_FILE_DIR:iPhoneMirror.Core.Tests>/fixtures
+    )
+    add_test(NAME CoreProtocolTests COMMAND iPhoneMirror.Core.Tests)
+    set_tests_properties(CoreProtocolTests PROPERTIES
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:iPhoneMirror.Core.Tests>
+    )
+
+    add_executable(iPhoneMirror.QtUsbTransport.Tests
+        tests/QtUsbTransportTests.cpp
+        src/Transport/QtUsbTransport.cpp
+        src/Protocol/QuickTimePacket.cpp)
+    target_include_directories(iPhoneMirror.QtUsbTransport.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/third_party/libusb/include)
+    target_compile_definitions(iPhoneMirror.QtUsbTransport.Tests PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(iPhoneMirror.QtUsbTransport.Tests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME QtUsbTransportTests COMMAND iPhoneMirror.QtUsbTransport.Tests)
+
+    add_executable(iPhoneMirror.LibUsb0Activation.Tests
+        tests/LibUsb0ActivationTests.cpp
+        src/Transport/LibUsb0Transport.cpp)
+    target_include_directories(iPhoneMirror.LibUsb0Activation.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/third_party/libusb/include
+        ${PROJECT_SOURCE_DIR}/third_party/libusb-win32/include)
+    target_compile_definitions(iPhoneMirror.LibUsb0Activation.Tests PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(iPhoneMirror.LibUsb0Activation.Tests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    target_link_libraries(iPhoneMirror.LibUsb0Activation.Tests PRIVATE shell32)
+    add_test(NAME LibUsb0ActivationTests COMMAND iPhoneMirror.LibUsb0Activation.Tests)
+
+    add_executable(iPhoneMirror.OutputModeState.Tests
+        tests/OutputModeStateTests.cpp)
+    target_include_directories(iPhoneMirror.OutputModeState.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_options(iPhoneMirror.OutputModeState.Tests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME OutputModeStateTests COMMAND iPhoneMirror.OutputModeState.Tests)
+
+    add_executable(iPhoneMirror.UsbConfigurationRestorePolicy.Tests
+        tests/UsbConfigurationRestorePolicyTests.cpp)
+    target_include_directories(iPhoneMirror.UsbConfigurationRestorePolicy.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_options(iPhoneMirror.UsbConfigurationRestorePolicy.Tests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME UsbConfigurationRestorePolicyTests
+        COMMAND iPhoneMirror.UsbConfigurationRestorePolicy.Tests)
+
+    add_executable(iPhoneMirror.UsbConfigurationSwitchIdentity.Tests
+        tests/UsbConfigurationSwitchIdentityTests.cpp
+        tools/UsbDeviceReconnect.cpp)
+    target_include_directories(iPhoneMirror.UsbConfigurationSwitchIdentity.Tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/third_party/libusb-win32/include)
+    target_compile_definitions(iPhoneMirror.UsbConfigurationSwitchIdentity.Tests PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(iPhoneMirror.UsbConfigurationSwitchIdentity.Tests PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    target_link_libraries(iPhoneMirror.UsbConfigurationSwitchIdentity.Tests PRIVATE cfgmgr32 setupapi advapi32)
+    add_test(NAME UsbConfigurationSwitchIdentityTests
+        COMMAND iPhoneMirror.UsbConfigurationSwitchIdentity.Tests)
+
+    if(IPHONEMIRROR_BUILD_DANGEROUS_USB_TOOLS)
+        add_executable(iPhoneMirror.LibUsb0Probe
+            tools/LibUsb0Probe.cpp
+            src/Transport/LibUsb0Transport.cpp
+            src/Protocol/QuickTimePacket.cpp
+        )
+        target_include_directories(iPhoneMirror.LibUsb0Probe PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${PROJECT_SOURCE_DIR}/third_party/libusb/include
+            ${PROJECT_SOURCE_DIR}/third_party/libusb-win32/include)
+        target_compile_options(iPhoneMirror.LibUsb0Probe PRIVATE
+            /W4 /permissive- /utf-8 /EHsc)
+        target_link_libraries(iPhoneMirror.LibUsb0Probe PRIVATE
+            "${PROJECT_SOURCE_DIR}/third_party/libusb-win32/lib/x64/libusb0-dynamic.lib")
+    else()
+        # Multi-config generators keep artifacts for targets removed from a
+        # later configure. Remove the old real-device probe so a default safe
+        # build cannot accidentally launch a stale binary.
+        foreach(config Debug Release RelWithDebInfo MinSizeRel)
+            file(REMOVE
+                "${CMAKE_CURRENT_BINARY_DIR}/${config}/iPhoneMirror.LibUsb0Probe.exe")
+        endforeach()
+        file(REMOVE
+            "${CMAKE_CURRENT_BINARY_DIR}/iPhoneMirror.LibUsb0Probe.exe")
+    endif()
+
+    add_executable(iPhoneMirror.PipelineSwitchProbe
+        tools/PipelineSwitchProbe.cpp)
+    target_include_directories(iPhoneMirror.PipelineSwitchProbe PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(iPhoneMirror.PipelineSwitchProbe PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(iPhoneMirror.PipelineSwitchProbe PRIVATE
+        /W4 /permissive- /utf-8 /EHsc)
+    target_link_libraries(iPhoneMirror.PipelineSwitchProbe PRIVATE
+        iPhoneMirror.Core)
+
+endif()
+
+install(TARGETS iPhoneMirror.Core iPhoneMirror.UsbConfigurationSwitch
+    RUNTIME DESTINATION .
+    LIBRARY DESTINATION .
+    ARCHIVE DESTINATION lib
+)

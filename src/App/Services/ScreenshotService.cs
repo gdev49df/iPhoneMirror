@@ -1,0 +1,99 @@
+using System.IO;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using IPhoneMirror.App.Localization;
+using IPhoneMirror.App.Interop;
+
+namespace IPhoneMirror.App.Services;
+
+internal static class ScreenshotService
+{
+    private static long _sequence;
+
+    internal static string CreateDefaultPath(string? directory = null)
+    {
+        directory ??= Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+        var sequence = Interlocked.Increment(ref _sequence);
+        return Path.Combine(directory,
+            $"iPhoneMirror-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{sequence:D3}.png");
+    }
+
+    internal static string CapturePng(Func<VideoFrame?> frameProvider, string destinationPath)
+    {
+        ArgumentNullException.ThrowIfNull(frameProvider);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+
+        var frame = frameProvider() ??
+            throw new InvalidOperationException(LocalizationService.Get("ScreenshotNoFrame"));
+        return SavePng(CreateBitmap(frame), destinationPath);
+    }
+
+    internal static byte[] EncodePng(VideoFrame frame)
+    {
+        using var stream = new MemoryStream();
+        WritePng(CreateBitmap(frame), stream);
+        return stream.ToArray();
+    }
+
+    internal static BitmapSource CreateBitmap(VideoFrame frame)
+    {
+        ValidateFrame(frame);
+        var required = (ulong)frame.Stride * frame.Height;
+        // NativeCore reuses its copy buffer. Own this frame before another
+        // preview/screenshot request can overwrite it.
+        var pixels = frame.Pixels.AsSpan(0, (int)required).ToArray();
+        var bitmap = BitmapSource.Create(
+            checked((int)frame.Width), checked((int)frame.Height),
+            96, 96, PixelFormats.Bgra32, null, pixels, checked((int)frame.Stride));
+        bitmap.Freeze();
+
+        return bitmap;
+    }
+
+    internal static void ValidateFrame(VideoFrame frame)
+    {
+        var required = (ulong)frame.Stride * frame.Height;
+        if (frame.Width == 0 || frame.Height == 0 || frame.Width > int.MaxValue ||
+            frame.Height > int.MaxValue || frame.Stride < (ulong)frame.Width * 4U ||
+            required > int.MaxValue || (ulong)frame.Pixels.Length < required)
+        {
+            throw new InvalidDataException(LocalizationService.Get("ScreenshotInvalidFrame"));
+        }
+    }
+
+    internal static string CaptureVisualPng(FrameworkElement visual, string destinationPath)
+    {
+        ArgumentNullException.ThrowIfNull(visual);
+        ArgumentException.ThrowIfNullOrWhiteSpace(destinationPath);
+
+        visual.UpdateLayout();
+        var width = checked((int)Math.Ceiling(visual.ActualWidth));
+        var height = checked((int)Math.Ceiling(visual.ActualHeight));
+        if (width <= 0 || height <= 0)
+            throw new InvalidOperationException(LocalizationService.Get("ScreenshotNoFrame"));
+
+        var bitmap = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
+        bitmap.Render(visual);
+        bitmap.Freeze();
+        return SavePng(bitmap, destinationPath);
+    }
+
+    private static string SavePng(BitmapSource bitmap, string destinationPath)
+    {
+        var fullPath = Path.GetFullPath(destinationPath);
+        var directory = Path.GetDirectoryName(fullPath);
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+
+        using var output = new FileStream(fullPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+        WritePng(bitmap, output);
+        return fullPath;
+    }
+    private static void WritePng(BitmapSource bitmap, Stream output)
+    {
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(bitmap));
+        encoder.Save(output);
+    }
+
+}

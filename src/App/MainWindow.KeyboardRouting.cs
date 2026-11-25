@@ -1,0 +1,256 @@
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Threading;
+using IPhoneMirror.App.Controls;
+using IPhoneMirror.App.Services;
+
+namespace IPhoneMirror.App;
+
+public partial class MainWindow
+{
+    private nint _lastKeyboardEventForeground;
+    private long _keyboardShortcutGeneration;
+    private void ObserveKeyboardForeground()
+    {
+        var foreground = _keyboardForegroundWindow();
+        var previous = _lastKeyboardEventForeground;
+        _lastKeyboardEventForeground = foreground;
+        if (previous != 0 && foreground != previous) ResetKeyboardOwnership();
+    }
+
+    private void ConfigureKeyboardShortcuts(IReadOnlyDictionary<BluetoothShortcutAction, KeyboardShortcut> shortcuts)
+    {
+        _keyboardRouter.InvalidateWindowShortcutMessages(unchecked((uint)Environment.TickCount));
+        ++_keyboardShortcutGeneration;
+        _keyboardRouter.ReleaseAllPressedKeys();
+        var bindings = new List<RoutedShortcut>();
+        foreach (var (action, shortcut) in shortcuts)
+        {
+            if (action == BluetoothShortcutAction.ReverseControl) continue;
+            bool Available() => !_mappingClosing && _mappingWindow?.IsEditing != true && _shortcutSettingsWindow is null && !_mappingCapture.Waiting &&
+                (IsGlobalControlShortcut(action) || IsControlKeyboardForeground);
+            bindings.Add(new(shortcut, action.ToString(), Available,
+                () => QueueKeyboardShortcut(() => HandleConfiguredShortcut(action), Available)));
+        }
+        ConfigureSettingShortcutBindings(bindings);
+        // User-configured actions keep precedence. Clipboard commands belong
+        // to the same recognizer in both Direct and Mapping input modes.
+        bindings.Add(new(new(KeyboardShortcut.Control, 0x43), "CopyFromDevice",
+            IsDeviceClipboardShortcutAvailable, () => QueueDeviceClipboardShortcut(copy: true)));
+        bindings.Add(new(new(KeyboardShortcut.Control, 0x56), "PasteToDevice",
+            IsDeviceClipboardShortcutAvailable, () => QueueDeviceClipboardShortcut(copy: false)));
+        void Local(int vk, uint modifiers, string name, Action execute, Func<bool>? condition = null, bool anyPreview = false,
+            bool fullScreenKey = false)
+        {
+            bool Available() => !_mappingClosing && _mappingWindow?.IsEditing != true && !_bossKeyHidden && _shortcutSettingsWindow is null &&
+                !_mappingCapture.Waiting && ((fullScreenKey ? IsFullScreenShortcutForeground : IsLocalShortcutForeground) ||
+                    (anyPreview && _secondaryMirrors.ContainsWindow(_keyboardForegroundWindow()))) && condition?.Invoke() != false;
+            bindings.Add(new(new(modifiers, (uint)vk), name, Available,
+                () => QueueKeyboardShortcut(execute, Available)));
+        }
+        Local(0x7A, 0, "FullScreen", ToggleKeyboardFullScreen, anyPreview: true, fullScreenKey: true);
+        Local(0x1B, 0, "ExitFullScreen", ToggleKeyboardFullScreen,
+            () => _isFullScreen || _secondaryMirrors.IsFullScreenWindow(_keyboardForegroundWindow()), anyPreview: true,
+            fullScreenKey: true);
+        Local(0x74, 0, "RefreshDevices", () => _ = _viewModel.RefreshAsync(forceDeviceEnumeration: true));
+        Local(0x52, KeyboardShortcut.Control, "RefreshPreview", RefreshPreview);
+        Local(0x50, KeyboardShortcut.Control | KeyboardShortcut.Shift, "PreviewWindow",
+            () => OnPreviewWindowClick(this, new RoutedEventArgs()));
+        Local(0x4C, KeyboardShortcut.Control, "Diagnostics", () =>
+        {
+            if (Application.Current is App app) app.ShowAboutWindow(this, _viewModel, showDiagnostics: true);
+        });
+        Local(0x4D, KeyboardShortcut.Control, "Audio", () => _viewModel.PlayAudio = !_viewModel.PlayAudio);
+        Local(0x53, KeyboardShortcut.Control, "Screenshot", () => _ = CaptureScreenshotAsync());
+        _keyboardRouter.Shortcuts.Configure(bindings);
+        ReconcileSettingMouseHook();
+    }
+
+    private bool IsLocalShortcutForeground =>
+        (_keyboardForegroundWindow() == _windowSource?.Handle && !IsMainKeyboardEditorFocused()) ||
+        (_secondaryMirrors.GetWindowHandle(_viewModel.SelectedDevice?.Udid) is var preview &&
+            preview != 0 && _keyboardForegroundWindow() == preview);
+
+    // F11/Esc stay usable beside an open settings panel; only a focused text
+    // entry keeps them. Other shortcuts keep the full editor guard above.
+    private bool IsFullScreenShortcutForeground =>
+        (_keyboardForegroundWindow() == _windowSource?.Handle && !IsFullScreenShortcutTextEntryFocused()) ||
+        (_secondaryMirrors.GetWindowHandle(_viewModel.SelectedDevice?.Udid) is var preview &&
+            preview != 0 && _keyboardForegroundWindow() == preview);
+
+    private void ToggleKeyboardFullScreen()
+    {
+        if (!_secondaryMirrors.ToggleFullScreenWindow(_keyboardForegroundWindow()))
+            _ = ToggleActiveFullScreenAsync();
+    }
+
+    private void QueueKeyboardShortcut(Action execute, Func<bool> available)
+    {
+        var generation = _keyboardRouter.Generation;
+        var shortcutGeneration = _keyboardShortcutGeneration;
+        var target = ActiveInputDeviceUdid;
+        var foreground = _keyboardForegroundWindow();
+        var focusGeneration = _mappingFocus?.Generation;
+        var queuedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        Dispatcher.BeginInvoke(() =>
+        {
+            var guardsValid = !_mappingClosing && generation == _keyboardRouter.Generation &&
+                shortcutGeneration == _keyboardShortcutGeneration &&
+                Models.DeviceViewModel.UdidEquals(target, ActiveInputDeviceUdid) &&
+                foreground == _keyboardForegroundWindow() &&
+                focusGeneration == _mappingFocus?.Generation;
+            var stillAvailable = guardsValid && available();
+            if (stillAvailable) execute();
+            else DiagnosticLogger.ReverseControl("keyboard_input", "shortcut_cancelled",
+                ("queue_ms", System.Diagnostics.Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds),
+                ("closing", _mappingClosing), ("availability_checked", guardsValid), ("available", stillAvailable),
+                ("owner_changed", generation != _keyboardRouter.Generation),
+                ("bindings_changed", shortcutGeneration != _keyboardShortcutGeneration),
+                ("target_changed", !Models.DeviceViewModel.UdidEquals(target, ActiveInputDeviceUdid)),
+                ("foreground_changed", foreground != _keyboardForegroundWindow()),
+                ("focus_changed", focusGeneration != _mappingFocus?.Generation));
+        }, DispatcherPriority.Input);
+    }
+
+    private bool TryRoutePreviewKeyboardEvent(Key key, PreviewKeyboardKind kind)
+    {
+        if (!CanForwardControlKeyboard(ActiveInputDeviceUdid, _windowSource?.Handle ?? 0)) return false;
+        if (_keyboardHook != 0 || _rawKeyboardInputEnabled) return true;
+        HandleControlKeyboardInput(new(kind, KeyInterop.VirtualKeyFromKey(key)), ActiveInputDeviceUdid);
+        return true;
+    }
+
+    private bool ProcessKeyboardHook(LowLevelKeyboardData data, nint message)
+    {
+        // Ignore our own shortcut replay, but allow remote desktop SendInput.
+        if (data.ExtraInformation == KeyboardReplayTag) return false;
+        var down = message is 0x100 or 0x104;
+        if (!down && message is not (0x101 or 0x105)) return false;
+        if (data.VirtualKey == 0xE7) // VK_PACKET: ScanCode is a UTF-16 code unit.
+            return TryQueueControlText(down ? ((char)data.ScanCode).ToString() : string.Empty);
+        var scan = (int)data.ScanCode;
+        var extended = (data.Flags & 1) != 0;
+        var key = new MappedKey(ModifierKeyIdentity((int)data.VirtualKey, scan | (extended ? 0x100 : 0)), scan, extended);
+        var diagnose = ObserveFunctionKey(key, down, ActiveInputDeviceUdid, "hook", data.Flags);
+        if ((data.Flags & 0x12) != 0 &&
+            !CanForwardControlKeyboard(ActiveInputDeviceUdid, GetControlKeyboardWindow(ActiveInputDeviceUdid)) &&
+            (down || (!_keyboardRouter.HasPressedKey(key) && !_mappingCapture.HasHeldKeys)))
+        {
+            diagnose?.Invoke(new("injected_input_guard"));
+            return false;
+        }
+        // An accepted down still owns its up after focus changes, including
+        // remote-desktop/injected releases. Dropping it leaves a stuck modifier.
+        FlushControlText();
+        return RouteObservedKeyboardEvent(key, down, ActiveInputDeviceUdid,
+            _activeControlWindow != 0 ? _activeControlWindow : _windowSource?.Handle ?? 0, diagnose, data.Time);
+    }
+
+    private bool RouteKeyboardEvent(MappedKey key, bool down, string? target, nint window)
+        => RouteObservedKeyboardEvent(key, down, target, window,
+            ObserveFunctionKey(key, down, target, "window"));
+
+    private bool RouteObservedKeyboardEvent(MappedKey key, bool down, string? target, nint window,
+        Action<KeyboardRouteDecision>? diagnose, uint? hookTime = null)
+    {
+        Dispatcher.VerifyAccess();
+        // An IME sentinel without a usable scan code is not a physical key.
+        // Leave it to Windows instead of claiming an untransmittable press.
+        if (key.VirtualKey == 0xE5) return false;
+        ObserveKeyboardForeground();
+        // Recording is the router's exclusive editor transaction, including
+        // the release of a key held when the transaction was cancelled.
+        if (_mappingCapture.Process(key, down, _mappingCapture.Waiting,
+            action => Dispatcher.BeginInvoke(action, DispatcherPriority.Input)))
+        {
+            // Recovery can quarantine this same physical key in the router.
+            // Recording owns its up, but both owners must forget the retired
+            // lifetime without dispatching it to a device or a shortcut.
+            if (!down) _keyboardRouter.ReleaseCapturedKey(key);
+            diagnose?.Invoke(new("mapping_capture"));
+            return true;
+        }
+        var generation = _keyboardRouter.Generation;
+        var sourceForeground = _keyboardForegroundWindow();
+        var mappingAllowed = IsKeyboardMappingInputModeActive && _mappingSettings.Enabled && MappingFocusAllows();
+        KeyboardPressRoute Resolve(MappedKey physical, bool chord)
+        {
+            if (_mappingClosing || generation != _keyboardRouter.Generation || sourceForeground != _keyboardForegroundWindow())
+                return new(KeyboardEventOwner.Retired, true);
+            if (mappingAllowed && !chord && _viewModel.GetMappingTargetStatus() == "MappingReady")
+            {
+                var mapping = _mappingSettings.Mappings.FirstOrDefault(m => m.Enabled && m.Key!.SamePhysicalKey(physical));
+                if (mapping is not null)
+                    return new(KeyboardEventOwner.Mapping, physical.IsWindows || _mappingSettings.SuppressOriginalKey,
+                        pressed =>
+                        {
+                            if (pressed) QueueMappedGesture(mapping);
+                            else _mappingHolds.Process(physical, false);
+                        });
+            }
+            var session = _mappingWindow?.IsEditing != true && IsDirectKeyboardInputModeActive && CanForwardControlKeyboard(target, window)
+                ? _viewModel.CaptureDirectKeyboardRoute(target) : null;
+            if (session is not null)
+                return new(KeyboardEventOwner.Direct, true, pressed => DispatchControlKeyboardInput(
+                    new(pressed ? PreviewKeyboardKind.Down : PreviewKeyboardKind.Up, physical.VirtualKey,
+                        physical.ScanCode | (physical.Extended ? 0x100 : 0)), target, false, window, session));
+            return new(KeyboardEventOwner.Windows, false);
+        }
+        var defer = mappingAllowed && (key.IsModifier || key.IsWindows) &&
+            _mappingSettings.Mappings.Any(m => m.Enabled && m.Key!.SamePhysicalKey(key));
+        return _keyboardRouter.RouteEvent(key, down, Resolve, ReplayKeyboardEvent, defer,
+            bufferShortcutModifiers: CanForwardControlKeyboard(target, window) && _keyboardRouter.Mode != KeyboardInputMode.None,
+            diagnose: diagnose, hookTime: hookTime);
+    }
+
+    private bool RecoverShortcutPressFromWindow(PreviewKeyboardEventArgs e, string? target, nint window)
+    {
+        if (e.Kind != PreviewKeyboardKind.Down || e.MessageTime is not { } time ||
+            _rawKeyboardInputEnabled || _mappingClosing || _mappingCapture.Waiting ||
+            _mappingCapture.HasHeldKeys || _shortcutSettingsWindow is not null ||
+            !Models.DeviceViewModel.UdidEquals(target, ActiveInputDeviceUdid) ||
+            !CanForwardControlKeyboard(target, window)) return false;
+        var key = new MappedKey(ModifierKeyIdentity(e.VirtualKey, e.ScanCode),
+            e.ScanCode & 0xFF, (e.ScanCode & 0x100) != 0);
+        return _keyboardRouter.RecoverShortcutPressFromWindow(key, time,
+            unchecked((uint)Environment.TickCount), e.IsRepeat,
+            decision => ObserveFunctionKey(key, true, target, "window_press")?.Invoke(decision));
+    }
+
+    private bool ReleaseShortcutFromWindow(PreviewKeyboardEventArgs e, string? target, nint window)
+    {
+        if (e.Kind != PreviewKeyboardKind.Up || e.MessageTime is not { } time ||
+            !Models.DeviceViewModel.UdidEquals(target, ActiveInputDeviceUdid) ||
+            window == 0 || window != GetControlKeyboardWindow(target)) return false;
+        var key = new MappedKey(ModifierKeyIdentity(e.VirtualKey, e.ScanCode),
+            e.ScanCode & 0xFF, (e.ScanCode & 0x100) != 0);
+        if (!_keyboardRouter.ReleaseShortcutFromWindow(key, time)) return false;
+        ObserveFunctionKey(key, false, target, "window_release")?.Invoke(new("shortcut_release_recovered"));
+        return true;
+    }
+
+    private static void ReplayKeyboardEvent(MappedKey key, bool down)
+    {
+        var input = new RouterNativeInput
+        {
+            Type = 1, VirtualKey = (ushort)key.VirtualKey, Scan = (ushort)key.ScanCode,
+            Flags = (key.Extended ? 1u : 0) | (down ? 0u : 2u),
+            ExtraInformation = KeyboardReplayTag,
+        };
+        if (RouterSendInput(1, [input], Marshal.SizeOf<RouterNativeInput>()) != 1)
+            DiagnosticLogger.ReverseControlWarning("keyboard_input", "replay_failed", ("error", Marshal.GetLastWin32Error()));
+    }
+    [StructLayout(LayoutKind.Explicit, Size = 40)]
+    private struct RouterNativeInput
+    {
+        [FieldOffset(0)] internal uint Type;
+        [FieldOffset(8)] internal ushort VirtualKey;
+        [FieldOffset(10)] internal ushort Scan;
+        [FieldOffset(12)] internal uint Flags;
+        [FieldOffset(24)] internal nint ExtraInformation;
+    }
+    private static readonly nint KeyboardReplayTag = (nint)0x49504D52;
+    [DllImport("user32.dll", EntryPoint = "SendInput", SetLastError = true)]
+    private static extern uint RouterSendInput(uint count, RouterNativeInput[] inputs, int size);
+}

@@ -1,0 +1,236 @@
+using System.Windows;
+using IPhoneMirror.App.Models;
+using IPhoneMirror.App.Localization;
+using IPhoneMirror.App.Services;
+using IPhoneMirror.App.Windows;
+
+namespace IPhoneMirror.App.ViewModels;
+
+internal sealed partial class MainViewModel
+{
+    private readonly Dictionary<string, DeviceControlSession> _deviceControls =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private DeviceControlSession? SelectedControl => FindControl(SelectedDevice?.Udid);
+    internal void SetControlInputDevice(string? udid)
+    {
+        if (_disposed) return;
+        ClipboardSync.SelectDevice(udid);
+        _ = FlushDeviceClipboardAsync();
+    }
+    internal bool IsDeviceControlEnabled(string? udid) => FindControl(udid)?.Enabled == true;
+
+    private DeviceControlSession? FindControl(string? udid) =>
+        udid is not null && _deviceControls.TryGetValue(udid, out var control) ? control : null;
+
+    private DeviceControlSession GetOrCreateControl(string udid)
+    {
+        if (_deviceControls.TryGetValue(udid, out var existing)) return existing;
+        var control = new DeviceControlSession(udid);
+        _deviceControls.Add(udid, control);
+        control.ControlStatus.StatusChanged += (_, snapshot) =>
+        {
+            // Automatic recovery must not take focus from another device.
+            // Its failure remains visible when this device is selected again.
+            if (_disposed || AutomationControlStartup.Contains(udid) ||
+                (control.WiredFinalRetryInProgress && snapshot.Prompt is null) ||
+                (snapshot.Prompt is null && snapshot.Stage != ControlStage.Failed)) return;
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher is null || dispatcher.HasShutdownStarted) return;
+            void ShowCurrentStatus()
+            {
+                if (_disposed || !ReferenceEquals(control.ControlStatus.Current, snapshot) ||
+                    (snapshot.Prompt is null &&
+                    !control.ControlStatus.QuietAutomaticStartup &&
+                    !DeviceViewModel.UdidEquals(SelectedDevice?.Udid, udid))) return;
+                if (!SetupActive && !AutomationControlStartup.Contains(udid) && Application.Current?.MainWindow is { } owner)
+                    ReverseControlStatusWindow.Show(owner, control.ControlStatus,
+                        () => _ = CancelReverseControlAsync(snapshot.Mode, udid),
+                        () => _ = StartDeviceControlAsync(udid, snapshot.Mode == ControlStatusMode.Wireless));
+            }
+            // Error presenters set their specific Retry action after publishing
+            // failure. Do not queue an older generic action over it, or reopen
+            // a window that the user has already closed.
+            if (dispatcher.CheckAccess()) ShowCurrentStatus();
+            else dispatcher.BeginInvoke(new Action(ShowCurrentStatus));
+        };
+        return control;
+    }
+
+    internal ControlStatusService GetControlStatus(ControlStatusMode mode, string? udid = null) =>
+        mode == ControlStatusMode.Bluetooth || (udid ?? SelectedDevice?.Udid) is not { } target
+            ? ControlStatus : GetOrCreateControl(target).ControlStatus;
+
+    private bool IsDeviceControlBusy(string? udid)
+    {
+        if (FindControl(udid) is { } control && (control.Enabled || control.Starting || control.Stopping))
+            return true;
+        var appleUdid = udid is null ? null : ResolveAppleUdid(udid);
+        return appleUdid is not null && _deviceControls.Values.Any(c =>
+            (c.Enabled || c.Starting || c.Stopping ||
+             (!DeviceViewModel.UdidEquals(c.DeviceUdid, udid) && c.WiredBridge is not null)) &&
+            DeviceViewModel.UdidEquals(c.AppleUdid, appleUdid));
+    }
+
+    private Task StartDeviceControlAsync(string? udid, bool wireless)
+    {
+        var target = udid ?? SelectedDevice?.Udid;
+        if (_disposed || _nativeKeyboardChanging || target is null) return Task.CompletedTask;
+        var device = Devices.FirstOrDefault(d => DeviceViewModel.UdidEquals(d.Udid, target));
+        var control = GetOrCreateControl(target);
+        control.ControlStatus.QuietAutomaticStartup = _mirroringControlStartup.Contains(target) || _deviceHubConnectionStartup.Contains(target);
+        var mode = wireless ? ControlStatusMode.Wireless : ControlStatusMode.Usb;
+        if (control.Enabled || control.Starting || control.Stopping) return Task.CompletedTask;
+        if (IsDeviceControlBusy(target))
+        {
+            control.ControlStatus.Failed(mode, device?.Name ?? "iPhone",
+                LocalizationService.Get("ControlDeviceNotReady"),
+                LocalizationService.Get("MultiDeviceControlAlreadyActive"));
+            return Task.CompletedTask;
+        }
+        if (wireless ? !CanEnableWirelessControlFor(device) : !CanEnableUsbControlFor(device))
+        {
+            control.ControlStatus.Failed(mode, device?.Name ?? "iPhone",
+                LocalizationService.Get("ControlDeviceNotReady"));
+            return Task.CompletedTask;
+        }
+        var operation = wireless ? control.WirelessOperation : control.WiredOperation;
+        return operation.RunAsync(token => StartDeviceControlCoreAsync(control, device!, wireless, token),
+            _shutdownCancellation.Token);
+    }
+
+    // Manual Retry and the final automatic attempt share startup and cleanup.
+    // The latter already owns WiredOperation, so it must not re-enter RunAsync.
+    private async Task StartDeviceControlCoreAsync(DeviceControlSession control, DeviceViewModel device,
+        bool wireless, CancellationToken token, bool automaticRecovery = false)
+    {
+        var target = control.DeviceUdid;
+        var mode = wireless ? ControlStatusMode.Wireless : ControlStatusMode.Usb;
+        try
+        {
+            // Only the operation admitted by SingleFlight may change startup
+            // state. A request that joins recovery must leave its state intact.
+            control.Starting = true;
+            // A failed stop still owns its USB claim. Both transport entry
+            // points retire it before changing bindings or creating a bridge.
+            if (control.WiredBridge is { } previousBridge)
+            {
+                NotifyUsbControlStateChanged();
+                try { await previousBridge.DisposeAsync(); }
+                catch (Exception cleanupError)
+                {
+                    token.ThrowIfCancellationRequested();
+                    control.Failed = true;
+                    var advice = LocalizationService.Get("ReverseControlStopFailureAdvice");
+                    control.Status = LocalizationService.Format("ReverseControlUsbStopFailedFormat", cleanupError.Message);
+                    control.ControlStatus.Failed(mode, device.Name, advice, cleanupError.Message);
+                    DiagnosticLogger.ReverseControlError("usb", "retry_cleanup_failed",
+                        ("error", AppLog.Error(cleanupError)));
+                    ShowDeviceControlError(control, LocalizationService.Get("ReverseControlTransportWired"),
+                        advice, "ReverseControlStopErrorTitle", AppLog.Error(cleanupError),
+                        retryOperation: () => StartDeviceControlAsync(target, wireless));
+                    return;
+                }
+                if (ReferenceEquals(control.WiredBridge, previousBridge))
+                {
+                    control.WiredBridge = null;
+                    control.WiredTarget = null;
+                }
+                token.ThrowIfCancellationRequested();
+                if (_disposed || control.Stopping) return;
+            }
+            // A rebind during cleanup must not silently control another phone.
+            if (automaticRecovery && !ValidateControlBinding(control, device, mode)) return;
+            if (!wireless && !automaticRecovery) control.WiredRecovery.Reset();
+            control.AppleUdid = null;
+            control.Binding = null;
+            control.Failed = false;
+            control.RequestedWireless = wireless;
+            control.Starting = true;
+            control.ControlStatus.Begin(mode, device.Name);
+            NotifyUsbControlStateChanged();
+            // Interactive entries share the same status surface. The final
+            // automatic attempt stays quiet unless it ultimately fails.
+            if (!automaticRecovery && !SetupActive && !AutomationControlStartup.Contains(target) && Application.Current?.MainWindow is { } owner)
+                ReverseControlStatusWindow.Show(owner, control.ControlStatus,
+                    () => _ = CancelReverseControlAsync(mode, target),
+                    () => _ = StartDeviceControlAsync(target, wireless));
+            token.ThrowIfCancellationRequested();
+            control.Binding = _identityResolver.ResolveControlBinding(device,
+                wireless ? ReverseControlMode.Wireless : ReverseControlMode.Usb);
+            if (!ValidateControlBinding(control, device, mode)) return;
+            control.AppleUdid = control.Binding!.TargetStableId;
+            if (wireless) await EnableWirelessControlCoreAsync(control, token);
+            else await EnableUsbControlCoreAsync(control, token);
+        }
+        finally
+        {
+            control.Starting = false;
+            NotifyUsbControlStateChanged();
+        }
+    }
+
+    private bool IsControlBindingCurrent(DeviceControlSession control, DeviceViewModel? device,
+        ControlStatusMode mode) => IsControlDeviceAvailable(device) &&
+        DeviceViewModel.UdidEquals(control.DeviceUdid, device!.Udid) &&
+        control.Binding?.Matches(_identityResolver.ResolveControlBinding(device,
+            mode == ControlStatusMode.Wireless ? ReverseControlMode.Wireless : ReverseControlMode.Usb)) == true;
+
+    private bool ValidateControlBinding(DeviceControlSession control,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] DeviceViewModel? device,
+        ControlStatusMode mode)
+    {
+        if (IsControlBindingCurrent(control, device, mode)) return true;
+        control.Router.Stop();
+        control.Failed = true;
+        control.Status = LocalizationService.Get("ControlBindingRequired");
+        control.ControlStatus.Failed(mode, device?.Name ?? "iPhone",
+            ControlBindingFailureMessage(),
+            LocalizationService.Get("ControlBindingAdvice"));
+        return false;
+    }
+
+    private void EnsureControlBindingCurrent(DeviceControlSession control, DeviceViewModel? device,
+        ControlStatusMode mode, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!IsControlBindingCurrent(control, device, mode))
+            throw new ControlBindingException(ControlBindingFailureMessage());
+    }
+
+    private sealed class ControlBindingException(string message) : InvalidOperationException(message);
+
+    private static string ControlBindingFailureMessage() => LocalizedText.Join("\n\n",
+        [LocalizationService.Get("ControlBindingRequired"), LocalizationService.Get("ControlBindingAdvice")]);
+
+    private Task DisableDeviceControlAsync(string? udid, bool wireless)
+    {
+        var control = FindControl(udid ?? SelectedDevice?.Udid);
+        return control is null ? Task.CompletedTask : wireless
+            ? DisableWirelessControlAsync(control) : DisableUsbControlAsync(control);
+    }
+
+    internal Task DisableUsbControlAsync() => DisableDeviceControlAsync(null, false);
+    private Task DisableWirelessControlAsync() => DisableDeviceControlAsync(null, true);
+
+    private void ShowDeviceControlError(DeviceControlSession control, string transport,
+        string? detail, string titleKey = "ReverseControlStartErrorTitle",
+        string? technicalDetails = null, Func<Task>? retryOperation = null) =>
+        ShowAutomationAwareControlError(control, transport, detail, titleKey, technicalDetails, retryOperation);
+
+    private void ShowAutomationAwareControlError(DeviceControlSession control, string transport,
+        string? detail, string titleKey, string? technicalDetails, Func<Task>? retryOperation)
+    {
+        if (control.WiredFinalRetryInProgress)
+        {
+            // Preserve the same actionable guidance as manual Retry, without
+            // showing a window until the final automatic attempt has finished.
+            control.ControlStatus.FailCurrent(detail ?? LocalizationService.Get("ControlOperationFailed"), technicalDetails);
+            if (!string.IsNullOrWhiteSpace(technicalDetails))
+                control.ControlStatus.AddDiagnostic(detail ?? LocalizationService.Get("ControlOperationFailed"), technicalDetails, "Error");
+            return;
+        }
+        if (AutomationControlStartup.Contains(control.DeviceUdid)) return;
+        ShowReverseControlError(transport, detail, titleKey, technicalDetails, retryOperation, control);
+    }
+}

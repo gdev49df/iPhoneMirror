@@ -1,0 +1,139 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsTestProject>true</IsTestProject>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\App\Services\SingleFlightOperation.cs" Link="SingleFlightOperation.cs" />
+    <Compile Include="..\App\Services\ClipboardSyncState.cs" Link="ClipboardSyncState.cs" />
+    <Compile Include="..\App\Services\Automation\AutomationSettings.cs" Link="AutomationSettings.cs" />
+    <PackageReference Include="WPF-UI" Version="4.3.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="DiagnosticLogMaintenanceTests.cs" />
+    <Compile Include="ExplorerWebDavTests.cs" />
+    <Compile Include="ExplorerWebDavLocksTests.cs" />
+    <Compile Include="ExplorerFileStoreTests.cs" />
+    <Compile Include="..\App\Services\Automation\AutomationException.cs" Link="Automation\AutomationException.cs" />
+    <Compile Include="..\App\Services\ExplorerMapping\IExplorerFileStore.cs" Link="ExplorerMapping\IExplorerFileStore.cs" />
+    <Compile Include="..\App\Services\ExplorerMapping\ExplorerWebDavServer.cs" Link="ExplorerMapping\ExplorerWebDavServer.cs" />
+    <Compile Include="..\App\Services\ExplorerMapping\ExplorerWebDavLocks.cs" Link="ExplorerMapping\ExplorerWebDavLocks.cs" />
+    <Compile Include="..\App\Services\ExplorerMapping\DeviceHubExplorerFileStore.cs" Link="ExplorerMapping\DeviceHubExplorerFileStore.cs" />
+    <Compile Include="AppProxyPolicyTests.cs" />
+    <Compile Include="MediaHttpProxyBridgeTests.cs" />
+    <Compile Include="..\App\Services\AppProxySettings.cs" Link="AppProxySettings.cs" />
+    <Compile Include="..\App\Services\AppProxyPolicy.cs" Link="AppProxyPolicy.cs" />
+    <Compile Include="..\App\Services\MediaHttpProxyBridge.cs" Link="MediaHttpProxyBridge.cs" />
+    <Compile Include="UpdaterHandoffTests.cs" />
+    <Compile Include="..\App\Services\AppleDisplayCatalog.cs" Link="AppleDisplayCatalog.cs" />
+    <Compile Include="..\App\Services\DeviceAppearance.cs" Link="DeviceAppearance.cs" />
+    <Compile Include="..\App\Services\DeviceAppearanceCache.cs" Link="DeviceAppearanceCache.cs" />
+    <Compile Include="..\App\Models\DeviceViewModel.cs" Link="DeviceViewModel.cs" />
+    <Compile Include="..\App\Models\DeviceControlPreferences.cs" Link="DeviceControlPreferences.cs" />
+    <Compile Include="..\App\Services\DeviceFrameCatalog.cs" Link="DeviceFrameCatalog.cs" />
+    <EmbeddedResource Include="..\..\config\apple-device-frames.json" LogicalName="IPhoneMirror.App.DeviceFrames.catalog.json" />
+    <EmbeddedResource Include="..\App\Assets\DeviceFrames\*.png" LogicalName="IPhoneMirror.App.DeviceFrames.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\config\apple-display-catalog.json"
+                      LogicalName="IPhoneMirror.App.Devices.AppleDisplayCatalog.json" />
+    <Compile Include="..\App\Services\CaptureMuxEndpointLease.cs" Link="CaptureMuxEndpointLease.cs" />
+    <Compile Include="ClipboardSyncTests.cs" />
+    <Compile Include="UxPlayComponentTests.cs" />
+    <Compile Include="ComponentDownloadNetworkTests.cs" />
+    <EmbeddedResource Include="..\..\config\uxplay-component.json" LogicalName="IPhoneMirror.App.Components.UxPlay.json" />
+    <Compile Include="IssueFixMediaTests.cs" />
+    <Compile Include="FcupHlsPlaybackTests.cs" />
+    <Compile Include="MediaCastStartupBudgetTests.cs" />
+    <Compile Include="WirelessRuntimeAvailabilityTests.cs" />
+    <Compile Include="WirelessOriginalCapabilityTests.cs" />
+    <Compile Include="MediaOutputCoordinatorTests.cs" />
+    <Compile Include="ReviewFixRegressionTests.cs" />
+    <Compile Include="..\App\Services\MediaOutputCoordinator.cs" Link="MediaOutputCoordinator.cs" />
+    <Compile Include="DotnetTestSmoke.cs" />
+    <Compile Include="..\Shared\Networking\SegmentedHttpDownloader.cs" Link="Networking\SegmentedHttpDownloader.cs" />
+    <Compile Include="..\App\Services\StableDeviceSelection.cs" Link="StableDeviceSelection.cs" />
+    <Compile Include="..\App\Services\UsbDeviceRefreshPolicy.cs" Link="UsbDeviceRefreshPolicy.cs" />
+    <Compile Include="..\App\Services\WifiSyncInsertionTracker.cs" Link="WifiSyncInsertionTracker.cs" />
+    <Compile Include="..\App\Services\DeviceBindingManager.cs" Link="DeviceBindingManager.cs" />
+    <Compile Include="..\App\Services\CaptureShutdownCoordinator.cs" Link="CaptureShutdownCoordinator.cs" />
+    <Compile Include="..\App\Services\DeviceSessionManager.cs" Link="DeviceSessionManager.cs" />
+    <Compile Include="..\App\Services\UsbRestoreRecoveryTracker.cs" Link="UsbRestoreRecoveryTracker.cs" />
+    <Compile Include="..\App\Services\SingleInstanceCoordinator.cs" Link="SingleInstanceCoordinator.cs" />
+    <Compile Include="..\App\Models\DeviceCornerProfile.cs" Link="DeviceCornerProfile.cs" />
+    <Compile Include="..\App\Models\DeviceCaptureState.cs" Link="DeviceCaptureState.cs" />
+    <Compile Include="..\App\Models\DeviceVideoPreferences.cs" Link="DeviceVideoPreferences.cs" />
+    <Compile Include="..\App\Services\DeviceCornerProfileResolver.cs" Link="DeviceCornerProfileResolver.cs" />
+    <Compile Include="..\App\Services\IndependentWindowAudioPolicy.cs" Link="IndependentWindowAudioPolicy.cs" />
+    <Compile Include="..\App\Services\DriverManagerLauncher.cs" Link="DriverManagerLauncher.cs" />
+    <Compile Include="..\App\Services\WindowsAutoPlayGuard.cs" Link="WindowsAutoPlayGuard.cs" />
+    <Compile Include="..\App\Services\ProtectedContentStatus.cs" Link="ProtectedContentStatus.cs" />
+    <Compile Include="..\App\Services\ThemeService.cs" Link="ThemeService.cs" />
+    <Compile Include="..\SharedUI\Controls\RoundedWindow.cs" Link="RoundedWindow.cs" />
+    <Compile Include="..\SharedUI\Services\AccessibilityAppearance.cs" Link="AccessibilityAppearance.cs" />
+    <Compile Include="..\SharedUI\Services\WindowWorkAreaController.cs" Link="WindowWorkAreaController.cs" />
+    <Compile Include="..\App\Localization\LocalizationService.cs" Link="LocalizationService.cs" />
+    <Compile Include="..\App\Localization\LocalizedText.cs" Link="LocalizedText.cs" />
+    <Compile Include="..\App\Services\WirelessReceiverService.cs" Link="WirelessReceiverService.cs" />
+    <Compile Include="..\App\Services\UxPlayComponent.cs" Link="UxPlayComponent.cs" />
+    <Compile Include="..\App\Services\WirelessStallRecoveryTracker.cs" Link="WirelessStallRecoveryTracker.cs" />
+    <Compile Include="..\App\Services\NativeLogTailReader.cs" Link="NativeLogTailReader.cs" />
+    <Compile Include="..\App\Services\AppLog.cs" Link="AppLog.cs" />
+    <Compile Include="..\App\Services\DiagnosticLogger.cs" Link="DiagnosticLogger.cs" />
+    <Compile Include="..\App\Services\StartupDiagnostics.cs" Link="StartupDiagnostics.cs" />
+    <Compile Include="..\App\Services\CaptureErrorGuidance.cs" Link="CaptureErrorGuidance.cs" />
+    <Compile Include="..\App\Services\IPhoneFilterDriverService.cs" Link="IPhoneFilterDriverService.cs" />
+    <Compile Include="..\App\Interop\NativeCore.cs" Link="NativeCore.cs" />
+    <Compile Include="..\App\Services\MediaSourceClassifier.cs" Link="MediaSourceClassifier.cs" />
+    <Compile Include="..\App\Services\MediaCastEventGate.cs" Link="MediaCastEventGate.cs" />
+    <Compile Include="..\App\Services\MediaCastPlaybackControls.cs" Link="MediaCastPlaybackControls.cs" />
+    <Compile Include="..\App\Services\HlsMediaPlaybackBridge.cs" Link="HlsMediaPlaybackBridge.cs" />
+    <Compile Include="..\App\Services\MediaCastStartupBudget.cs" Link="MediaCastStartupBudget.cs" />
+    <Compile Include="..\App\Services\MediaCastAudioDecoder.cs" Link="MediaCastAudioDecoder.cs" />
+    <Compile Include="..\App\Services\MediaRecoveryBackoff.cs" Link="MediaRecoveryBackoff.cs" />
+    <Compile Include="..\App\Services\BluetoothControlNoticePolicy.cs" Link="BluetoothControlNoticePolicy.cs" />
+    <Compile Include="..\App\Services\BluetoothHidProtocol.cs" Link="BluetoothHidProtocol.cs" />
+    <Compile Include="..\App\Services\BluetoothClientRouteTable.cs" Link="BluetoothClientRouteTable.cs" />
+    <Compile Include="..\App\Services\KeyboardShortcut.cs" Link="KeyboardShortcut.cs" />
+    <Compile Include="..\App\Services\SettingShortcutBinding.cs" Link="SettingShortcutBinding.cs" />
+    <Compile Include="..\App\Services\KeyboardMapping.cs" Link="KeyboardMapping.cs" />
+    <Compile Include="..\App\Services\BluetoothMouseOrientationMapper.cs" Link="BluetoothMouseOrientationMapper.cs" />
+    <Compile Include="..\App\Services\BluetoothMouseReportCoalescer.cs" Link="BluetoothMouseReportCoalescer.cs" />
+    <Compile Include="..\App\Services\AppleProductNames.cs" Link="AppleProductNames.cs" />
+    <Compile Include="..\App\Services\MediaOutputService.cs" Link="MediaOutputService.cs" />
+    <Compile Include="..\App\Services\MediaOutputMicrophone.cs" Link="MediaOutputMicrophone.cs" />
+    <Compile Include="..\App\Services\CompactLaunchOptions.cs" Link="CompactLaunchOptions.cs" />
+    <Compile Include="..\App\Services\CompactLaunchChannel.cs" Link="CompactLaunchChannel.cs" />
+    <Compile Include="..\App\Services\RawMouseDeltaTracker.cs" Link="RawMouseDeltaTracker.cs" />
+    <Compile Include="..\App\Services\RuntimeBinaryIntegrity.cs" Link="RuntimeBinaryIntegrity.cs" />
+    <Compile Include="..\App\Services\PendingRecordingStore.cs" Link="PendingRecordingStore.cs" />
+    <Compile Include="..\App\Updater\SemanticVersion.cs" Link="Updater\SemanticVersion.cs" />
+    <Compile Include="..\App\Updater\ReleaseParser.cs" Link="Updater\ReleaseParser.cs" />
+    <Compile Include="..\App\Updater\UpdateSettingsStore.cs" Link="Updater\UpdateSettingsStore.cs" />
+    <Compile Include="..\App\Services\PreviewToolbarSettings.cs" Link="PreviewToolbarSettings.cs" />
+    <Compile Include="..\App\Updater\GitHubReleaseClient.cs" Link="Updater\GitHubReleaseClient.cs" />
+    <Compile Include="..\App\Updater\LocalizedReleaseNotes.cs" Link="Updater\LocalizedReleaseNotes.cs" />
+    <EmbeddedResource Include="..\..\CHANGELOG.zh-TW.md" WithCulture="false"
+                      LogicalName="Localization.CHANGELOG.zh-TW.md" />
+    <Compile Include="..\App\Updater\VersionManager.cs" Link="Updater\VersionManager.cs" />
+    <Compile Include="..\App\Updater\UpdateInstallerLauncher.cs" Link="Updater\UpdateInstallerLauncher.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\App\tools\updater\Apply-ZipUpdate.ps1"
+                      LogicalName="IPhoneMirror.App.Updater.Apply-ZipUpdate.ps1" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="MSTest.TestAdapter" Version="3.8.2" />
+    <PackageReference Include="MSTest.TestFramework" Version="3.8.2" />
+  </ItemGroup>
+
+  <Target Name="RunSmokeTests" BeforeTargets="VSTest" DependsOnTargets="Build">
+    <Exec Command="dotnet run --no-restore --no-build --project &quot;$(MSBuildProjectFullPath)&quot; --configuration $(Configuration)" />
+  </Target>
+</Project>
